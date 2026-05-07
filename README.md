@@ -34,7 +34,7 @@ npm install
 2. Cria conta
 3. Vai a Keys → Create Key
 4. Cola a key na app em `Settings → Provider → OpenRouter Key`
-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
+
 
 ### 3. Correr em desenvolvimento
 
