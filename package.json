@@ -1,0 +1,35 @@
+{
+  "name": "bliss-agent",
+  "version": "1.0.0",
+  "description": "Bliss AI Code Agent — Electron + Vue 3 + Qwen3",
+  "main": "src/main/index.js",
+  "scripts": {
+    "dev": "node scripts/dev.js",
+    "build": "vite build && electron-builder",
+    "electron": "electron ."
+  },
+  "dependencies": {
+    "highlight.js": "^11.11.1",
+    "node-fetch": "^3.3.2"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "concurrently": "^8.2.0",
+    "electron": "^29.0.0",
+    "electron-builder": "^24.0.0",
+    "vite": "^5.0.0",
+    "vue": "^3.4.0",
+    "wait-on": "^7.2.0"
+  },
+  "build": {
+    "appId": "com.bliss.agent",
+    "productName": "Bliss Agent",
+    "files": [
+      "dist/**/*",
+      "src/main/**/*"
+    ],
+    "directories": {
+      "output": "release"
+    }
+  }
+}
