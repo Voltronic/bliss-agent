@@ -7,6 +7,7 @@ const https = require('https')
 const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 const TOOL_WORKER_PATH = path.join(__dirname, 'tool-worker.js')
 const activeAgentRuns = new Map()
+const chatApprovalPolicies = new Map()
 const providerModelCursor = new Map()
 const providerModelAvailability = new Map()
 
@@ -69,6 +70,9 @@ const APPROVAL_REQUIRED_TOOLS = {
   github_pr_comment: { label: 'Comment on GitHub PR', riskLevel: 'high' },
   github_pr_merge: { label: 'Merge GitHub PR', riskLevel: 'high' },
   github_pr_create: { label: 'Create draft PR', riskLevel: 'high' },
+  github_pr_review_thread_reply: { label: 'Reply to GitHub PR review thread', riskLevel: 'high' },
+  github_pr_review_thread_resolve: { label: 'Resolve GitHub PR review thread', riskLevel: 'high' },
+  github_pr_ready: { label: 'Change GitHub PR ready state', riskLevel: 'high' },
   create_directory: { label: 'Create directory', riskLevel: 'medium' },
   delete_file: { label: 'Delete file', riskLevel: 'high' },
 }
@@ -93,6 +97,93 @@ function getAgentRunKey(senderId, runId) {
 
 function getProviderCursorKey(senderId, provider) {
   return `${senderId}:${provider}`
+}
+
+function getChatApprovalPolicyKey(senderId, chatId) {
+  if (!chatId) return ''
+  return `${senderId}:${chatId}`
+}
+
+function normalizeApprovalPolicy(policy) {
+  const allowedTools = {}
+
+  if (policy?.allowedTools && typeof policy.allowedTools === 'object') {
+    for (const [toolName, allowed] of Object.entries(policy.allowedTools)) {
+      if (allowed && typeof toolName === 'string' && toolName.trim()) {
+        allowedTools[toolName] = true
+      }
+    }
+  }
+
+  return {
+    allowAll: Boolean(policy?.allowAll),
+    allowedTools,
+  }
+}
+
+function shouldAutoApproveTool(policy, toolName) {
+  const normalizedPolicy = normalizeApprovalPolicy(policy)
+  if (!toolName) return normalizedPolicy.allowAll
+  return normalizedPolicy.allowAll || Boolean(normalizedPolicy.allowedTools[toolName])
+}
+
+function buildApprovalPolicyForScope(policy, toolName, scope) {
+  const normalizedPolicy = normalizeApprovalPolicy(policy)
+
+  if (scope === 'chat') {
+    return {
+      allowAll: true,
+      allowedTools: { ...normalizedPolicy.allowedTools },
+    }
+  }
+
+  if (scope === 'tool' && toolName) {
+    return {
+      allowAll: normalizedPolicy.allowAll,
+      allowedTools: {
+        ...normalizedPolicy.allowedTools,
+        [toolName]: true,
+      },
+    }
+  }
+
+  return normalizedPolicy
+}
+
+function getStoredChatApprovalPolicy(senderId, chatId) {
+  const policyKey = getChatApprovalPolicyKey(senderId, chatId)
+  if (!policyKey || !chatApprovalPolicies.has(policyKey)) {
+    return normalizeApprovalPolicy(null)
+  }
+
+  return normalizeApprovalPolicy(chatApprovalPolicies.get(policyKey))
+}
+
+function setStoredChatApprovalPolicy(senderId, chatId, policy) {
+  const policyKey = getChatApprovalPolicyKey(senderId, chatId)
+  if (!policyKey) return normalizeApprovalPolicy(null)
+
+  const normalizedPolicy = normalizeApprovalPolicy(policy)
+  const hasExplicitRules = normalizedPolicy.allowAll || Object.keys(normalizedPolicy.allowedTools).length > 0
+
+  if (hasExplicitRules) {
+    chatApprovalPolicies.set(policyKey, normalizedPolicy)
+  } else {
+    chatApprovalPolicies.delete(policyKey)
+  }
+
+  return normalizedPolicy
+}
+
+function syncApprovalPolicyToActiveRuns(senderId, chatId, policy) {
+  if (!chatId) return
+
+  const normalizedPolicy = normalizeApprovalPolicy(policy)
+  for (const [runKey, runState] of activeAgentRuns.entries()) {
+    if (runState.chatId === chatId && runKey.startsWith(`${senderId}:`)) {
+      runState.approvalPolicy = normalizedPolicy
+    }
+  }
 }
 
 function resetProviderModelCursor(cursorKey) {
@@ -698,7 +789,7 @@ function parseInlineToolCalls(content) {
 
     try {
       const parsed = JSON.parse(rawJson)
-      const toolName = parsed.name || parsed.tool || parsed.function?.name
+      const toolName = normalizeRequestedToolName(parsed.name || parsed.tool || parsed.function?.name)
       const rawArguments = parsed.arguments ?? parsed.args ?? parsed.function?.arguments ?? {}
 
       if (toolName) {
@@ -777,28 +868,66 @@ function summarizeToolResult(toolName, result) {
   return `${toolName} completed successfully`
 }
 
+function buildModelFileExcerpt(content, options = {}) {
+  const text = typeof content === 'string' ? content : ''
+  const maxLines = Math.max(1, Number(options.maxLines) || 120)
+  const maxChars = Math.max(1, Number(options.maxChars) || 6000)
+
+  if (!text) {
+    return {
+      excerpt: '',
+      truncated: false,
+      lineCount: 0,
+      excerptLineCount: 0,
+    }
+  }
+
+  const lines = text.split(/\r?\n/)
+  const limitedLines = lines.slice(0, maxLines)
+  let excerpt = limitedLines.join('\n')
+  let truncated = limitedLines.length < lines.length
+
+  if (excerpt.length > maxChars) {
+    excerpt = excerpt.slice(0, maxChars)
+    truncated = true
+  }
+
+  return {
+    excerpt,
+    truncated,
+    lineCount: lines.length,
+    excerptLineCount: excerpt ? excerpt.split(/\r?\n/).length : 0,
+  }
+}
+
 function buildToolResultForModel(toolName, toolArgs, result) {
   if (toolName === 'read_file') {
     const content = typeof result?.content === 'string' ? result.content : ''
+    const excerptInfo = buildModelFileExcerpt(content, { maxLines: 140, maxChars: 7000 })
     return JSON.stringify({
       success: Boolean(result?.success),
       path: toolArgs?.path || result?.path || '',
-      totalLines: content ? content.split(/\r?\n/).length : 0,
-      contentOmitted: true,
-      note: 'State only that the content is available via the inspector button in the tool result. Do not claim it was already opened. Do not mention privacy, security, policy, or data protection reasons. Do not reproduce the raw file contents in chat. Summarize briefly or ask whether the user wants a specific section.',
+      totalLines: excerptInfo.lineCount,
+      excerptStartLine: 1,
+      excerptEndLine: excerptInfo.excerptLineCount,
+      excerptTruncated: excerptInfo.truncated,
+      excerpt: excerptInfo.excerpt,
+      note: 'Use the excerpt for reasoning. If you need another part of the file, call read_file_range for the relevant lines. Do not paste raw file contents into the final chat reply; summarize briefly and continue the task when the request is actionable.',
     })
   }
 
   if (toolName === 'read_file_range') {
     const content = typeof result?.content === 'string' ? result.content : ''
+    const excerptInfo = buildModelFileExcerpt(content, { maxLines: 220, maxChars: 9000 })
     return JSON.stringify({
       success: Boolean(result?.success),
       path: toolArgs?.path || result?.path || '',
       startLine: result?.startLine || toolArgs?.startLine || 1,
       endLine: result?.endLine || toolArgs?.endLine || 1,
-      linesReturned: content ? content.split(/\r?\n/).length : 0,
-      contentOmitted: true,
-      note: 'State only that the content is available via the inspector button in the tool result. Do not claim it was already opened. Do not mention privacy, security, policy, or data protection reasons. Do not reproduce the raw file contents in chat. Summarize briefly or ask whether the user wants another range.',
+      linesReturned: excerptInfo.lineCount,
+      excerptTruncated: excerptInfo.truncated,
+      excerpt: excerptInfo.excerpt,
+      note: 'Use the excerpt for reasoning. Ask for another range with read_file_range only when you need additional nearby lines. Do not paste raw file contents into the final chat reply; summarize briefly and continue the task when the request is actionable.',
     })
   }
 
@@ -1076,6 +1205,24 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'github_issue_list',
+      description: 'List and search GitHub issues for the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          state: { type: 'string', description: 'Issue state: open, closed, or all' },
+          limit: { type: 'number', description: 'Maximum number of issues to return' },
+          search: { type: 'string', description: 'Optional free-text search query' },
+          labels: { type: 'string', description: 'Optional comma-separated labels to filter by' },
+          assignee: { type: 'string', description: 'Optional assignee filter' },
+          author: { type: 'string', description: 'Optional author filter' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'github_issue_view',
       description: 'Read a GitHub issue by number from the repository associated with the selected working directory',
       parameters: {
@@ -1173,8 +1320,43 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'github_pr_list',
+      description: 'List and search GitHub pull requests for the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          state: { type: 'string', description: 'Pull request state: open, closed, merged, or all' },
+          limit: { type: 'number', description: 'Maximum number of pull requests to return' },
+          search: { type: 'string', description: 'Optional free-text search query' },
+          labels: { type: 'string', description: 'Optional comma-separated labels to filter by' },
+          assignee: { type: 'string', description: 'Optional assignee filter' },
+          author: { type: 'string', description: 'Optional author filter' },
+          base: { type: 'string', description: 'Optional base branch filter' },
+          head: { type: 'string', description: 'Optional head branch filter' },
+          draft: { type: 'boolean', description: 'Optional draft-only filter when true' }
+        }
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'github_pr_view',
       description: 'Read a GitHub pull request by number from the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number', description: 'Pull request number to inspect' }
+        },
+        required: ['number']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_pr_checks',
+      description: 'Inspect status checks and merge readiness for a GitHub pull request from the repository associated with the selected working directory',
       parameters: {
         type: 'object',
         properties: {
@@ -1201,6 +1383,20 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'github_pr_review_threads',
+      description: 'Read review threads for a GitHub pull request from the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number', description: 'Pull request number to inspect' }
+        },
+        required: ['number']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'github_pr_edit',
       description: 'Edit a GitHub pull request in the repository associated with the selected working directory using the GitHub CLI',
       parameters: {
@@ -1213,7 +1409,9 @@ const TOOLS = [
           addLabels: { type: 'string', description: 'Optional comma-separated labels to add' },
           removeLabels: { type: 'string', description: 'Optional comma-separated labels to remove' },
           addAssignees: { type: 'string', description: 'Optional comma-separated assignees to add' },
-          removeAssignees: { type: 'string', description: 'Optional comma-separated assignees to remove' }
+          removeAssignees: { type: 'string', description: 'Optional comma-separated assignees to remove' },
+          addReviewers: { type: 'string', description: 'Optional comma-separated reviewers to request' },
+          removeReviewers: { type: 'string', description: 'Optional comma-separated reviewers to remove' }
         },
         required: ['number']
       }
@@ -1284,6 +1482,37 @@ const TOOLS = [
   {
     type: 'function',
     function: {
+      name: 'github_pr_review_thread_reply',
+      description: 'Reply to a GitHub pull request review thread comment using the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number', description: 'Pull request number that owns the review thread' },
+          commentId: { type: 'number', description: 'Top-level review comment ID to reply to' },
+          body: { type: 'string', description: 'Reply body' }
+        },
+        required: ['number', 'commentId', 'body']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_pr_review_thread_resolve',
+      description: 'Resolve or unresolve a GitHub pull request review thread for the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          threadId: { type: 'string', description: 'GraphQL review thread ID' },
+          resolved: { type: 'boolean', description: 'Whether the thread should be resolved (true) or unresolved (false)' }
+        },
+        required: ['threadId', 'resolved']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
       name: 'github_pr_merge',
       description: 'Merge a GitHub pull request in the repository associated with the selected working directory using the GitHub CLI',
       parameters: {
@@ -1298,6 +1527,21 @@ const TOOLS = [
           admin: { type: 'boolean', description: 'Use admin privileges to merge when permitted' }
         },
         required: ['number']
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'github_pr_ready',
+      description: 'Mark a GitHub pull request as ready for review or convert it back to draft in the repository associated with the selected working directory',
+      parameters: {
+        type: 'object',
+        properties: {
+          number: { type: 'number', description: 'Pull request number to update' },
+          ready: { type: 'boolean', description: 'True to mark ready for review, false to convert back to draft' }
+        },
+        required: ['number', 'ready']
       }
     }
   },
@@ -1419,8 +1663,14 @@ function describeApprovalRequest(baseDir, toolName, toolArgs) {
       return `Reopen PR #${toolArgs.number || '?'}`
     case 'github_pr_comment':
       return `Comment on PR #${toolArgs.number || '?'}: ${truncatePreview(toolArgs.body || '', 180) || 'No comment body provided'}`
+    case 'github_pr_review_thread_reply':
+      return `Reply to PR #${toolArgs.number || '?'} review thread comment #${toolArgs.commentId || '?'}: ${truncatePreview(toolArgs.body || '', 180) || 'No reply body provided'}`
+    case 'github_pr_review_thread_resolve':
+      return `${toolArgs.resolved === false ? 'Unresolve' : 'Resolve'} review thread ${truncatePreview(toolArgs.threadId || '', 120) || '(missing thread id)'}`
     case 'github_pr_merge':
       return `Merge PR #${toolArgs.number || '?'} using ${toolArgs.method || 'merge'}`
+    case 'github_pr_ready':
+      return `${toolArgs.ready === false ? 'Convert' : 'Mark'} PR #${toolArgs.number || '?'} ${toolArgs.ready === false ? 'to draft' : 'as ready for review'}`
     case 'github_pr_create':
       return `Create draft PR: ${truncatePreview(toolArgs.title || '', 180) || 'No PR title provided'}`
     case 'create_directory':
@@ -1443,8 +1693,23 @@ async function requestToolApproval(runState, sendUpdate, baseDir, toolName, tool
   const requestId = `approval-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
   const summary = describeApprovalRequest(baseDir, toolName, toolArgs)
 
+  if (shouldAutoApproveTool(runState.approvalPolicy, toolName)) {
+    const decision = runState.approvalPolicy?.allowAll ? 'approved-all-chat' : 'approved-all-tool'
+    sendUpdate({
+      type: 'approval_auto_approved',
+      requestId,
+      tool: toolName,
+      args: toolArgs,
+      title: approvalConfig.label,
+      riskLevel: approvalConfig.riskLevel,
+      summary,
+      decision,
+    })
+    return { approved: true, cancelled: false, requestId, decision }
+  }
+
   return new Promise((resolve) => {
-    runState.pendingApproval = { requestId, resolve }
+    runState.pendingApproval = { requestId, resolve, toolName }
     sendUpdate({
       type: 'approval_required',
       requestId,
@@ -1757,12 +2022,12 @@ async function runGitTool(baseDir, args, runState) {
 }
 
 function runShellCommand(command, cwd, runState) {
-  return runExecCommand(command, { cwd, timeout: 120000 }, runState, (error, stdout, stderr) => ({
+  return runExecCommand(command, { cwd, timeout: 120000, maxBuffer: 256 * 1024 }, runState, (error, stdout, stderr) => ({
     success: !error,
-    stdout: stdout || '',
-    stderr: stderr || '',
+    stdout: truncatePreview(stdout || '', 12000),
+    stderr: truncatePreview(stderr || '', 12000),
     exitCode: error?.code || 0,
-    error: error ? (stderr || stdout || error.message || 'Command failed').trim() : null,
+    error: error ? truncatePreview((stderr || stdout || error.message || 'Command failed').trim(), 12000) : null,
   }))
 }
 
@@ -1808,6 +2073,7 @@ async function runValidationTool(kind, workingDir, requestedPath, runState) {
   const result = await runShellCommand(validation.command, validationCwd, runState)
   return {
     ...result,
+    validationKind: kind,
     command: validation.command,
     runner: validation.label,
     workingDirectory: validationCwd,
@@ -1846,6 +2112,26 @@ function parseGitHubRepoSlug(remoteUrl) {
   if (sshMatch) return sshMatch[1]
 
   return null
+}
+
+function parseGitHubRepoParts(repoSlug) {
+  const [owner, name] = String(repoSlug || '').split('/')
+  if (!owner || !name) return null
+  return { owner, name }
+}
+
+function runGhGraphQl(query, variables, cwd, runState) {
+  const args = ['api', 'graphql', '-f', `query=${query}`]
+
+  for (const [key, value] of Object.entries(variables || {})) {
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      args.push('-F', `${key}=${value}`)
+    } else {
+      args.push('-f', `${key}=${String(value ?? '')}`)
+    }
+  }
+
+  return runGhCommand(args, cwd, runState)
 }
 
 
@@ -2020,6 +2306,533 @@ function hasToolArg(args, key) {
   return Boolean(args) && Object.prototype.hasOwnProperty.call(args, key)
 }
 
+function normalizeRequestedToolName(name) {
+  const rawName = String(name || '').trim()
+  if (!rawName) return ''
+
+  return rawName
+    .replace(/<[^>]*>/g, '')
+    .replace(/[\r\n\t]/g, ' ')
+    .trim()
+}
+
+function stripToolArgumentCodeFence(rawArguments) {
+  return String(rawArguments || '')
+    .trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/\s*```$/i, '')
+    .trim()
+}
+
+function extractBalancedJsonCandidate(rawArguments) {
+  const text = String(rawArguments || '')
+  const startIndex = text.search(/[\[{]/)
+  if (startIndex === -1) return ''
+
+  const opener = text[startIndex]
+  const closer = opener === '{' ? '}' : ']'
+  let depth = 0
+  let inString = false
+  let escaped = false
+
+  for (let index = startIndex; index < text.length; index++) {
+    const char = text[index]
+
+    if (inString) {
+      if (escaped) {
+        escaped = false
+      } else if (char === '\\') {
+        escaped = true
+      } else if (char === '"') {
+        inString = false
+      }
+      continue
+    }
+
+    if (char === '"') {
+      inString = true
+      continue
+    }
+
+    if (char === opener) {
+      depth += 1
+      continue
+    }
+
+    if (char === closer) {
+      depth -= 1
+      if (depth === 0) {
+        return text.slice(startIndex, index + 1)
+      }
+    }
+  }
+
+  return text.slice(startIndex).trim()
+}
+
+function repairCommonToolArgumentJsonIssues(rawArguments) {
+  return String(rawArguments || '')
+    .trim()
+    .replace(/[\u201C\u201D]/g, '"')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3')
+    .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, value) => `: ${JSON.stringify(value.replace(/\\'/g, "'"))}`)
+    .replace(/,\s*([}\]])/g, '$1')
+    .replace(/("(?:\\.|[^"])*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[}\]])\s+(?=(?:"?[A-Za-z_$][\w$-]*"?\s*:))/g, '$1, ')
+}
+
+function shouldAttemptExpensiveToolArgumentRepair(toolName, rawText) {
+  const normalizedToolName = String(toolName || '').trim()
+  if (!rawText) return false
+  if (rawText.length > 4000) return false
+  if (normalizedToolName === 'write_file' || normalizedToolName === 'apply_patch') return false
+  if (/("content"\s*:|"newText"\s*:|"oldText"\s*:)/.test(rawText)) return false
+  return true
+}
+
+function parseToolArguments(toolName, rawArguments) {
+  const rawText = String(rawArguments || '').trim()
+  if (!rawText) {
+    return { success: true, args: {}, repaired: false }
+  }
+
+  const candidates = []
+  const seen = new Set()
+
+  function addCandidate(value, repaired = false) {
+    const text = String(value || '').trim()
+    if (!text || seen.has(text)) return
+    seen.add(text)
+    candidates.push({ text, repaired })
+  }
+
+  addCandidate(rawText)
+  const unfenced = stripToolArgumentCodeFence(rawText)
+  addCandidate(unfenced)
+  addCandidate(extractBalancedJsonCandidate(unfenced))
+
+  if (shouldAttemptExpensiveToolArgumentRepair(toolName, rawText)) {
+    const baseCandidates = candidates.slice()
+    for (const candidate of baseCandidates) {
+      addCandidate(repairCommonToolArgumentJsonIssues(candidate.text), true)
+      addCandidate(repairCommonToolArgumentJsonIssues(extractBalancedJsonCandidate(candidate.text)), true)
+    }
+  }
+
+  let lastError = null
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate.text)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        lastError = new Error('Tool arguments must be a JSON object')
+        continue
+      }
+
+      return {
+        success: true,
+        args: parsed,
+        repaired: candidate.repaired,
+      }
+    } catch (error) {
+      lastError = error
+    }
+  }
+
+  return {
+    success: false,
+    error: lastError?.message || 'Invalid JSON',
+  }
+}
+
+const MUTATING_TOOL_NAMES = new Set(['apply_patch', 'write_file', 'delete_file', 'create_directory'])
+const VERIFICATION_TOOL_NAMES = new Set(['read_file', 'read_file_range', 'git_diff', 'run_build', 'run_test', 'run_lint'])
+const AUTO_RECOVERY_VALIDATION_TOOL_NAMES = new Set(['run_build', 'run_test', 'run_lint'])
+const NON_EXECUTION_INTENT_NAMES = new Set(['read', 'explain', 'review'])
+const MAX_AUTOMATIC_VALIDATION_RECOVERY_ATTEMPTS = 3
+const MAX_TOOL_ARGUMENT_PAYLOAD_LENGTH = 120000
+
+const IMPLEMENTATION_INTENT_PATTERN = /(fix|bugfix|corrig(?:e|ir|e-me|e isto)?|implement(?:a|ar)?|adicion(?:a|ar)|cria(?:r)?|altera(?:r)?|muda(?:r)?|refactor(?:a|ar)?|update|transform(?:a|ar)?|resolve(?:r)?|repair|patch|write|edit|faz(?:er)?|criar|atualiza(?:r)?)/i
+const EXPLANATION_INTENT_PATTERN = /(explica(?:r)?|explain|porque|porqu[eê]|why|como funciona|how does|how do|o que (?:[ée]|faz)|what is|what does|mostra(?:-me)?|show me|conte[uú]do|content|review|revisa(?:r)?|analisa(?:r)?|summari[sz]e|resume|arquitetura|architecture)/i
+const DIRECT_IMPLEMENTATION_REQUEST_PATTERN = /(corrige|implementa|adiciona|cria|altera|muda|refatora|transforma|resolve|repara|atualiza|faz|escreve|fix|implement|add|create|change|update|edit|patch|repair|write)/i
+const GUIDANCE_ABOUT_IMPLEMENTATION_PATTERN = /((how (?:to|do i|can i))|como|qual a melhor forma de|what is the best way to|podes explicar como|can you explain how to)\s+(fix|implement|add|create|change|update|edit|patch|repair|resolve|corrigir|implementar|adicionar|criar|alterar|mudar|refatorar|transformar|resolver|atualizar|fazer)/i
+const REVIEW_INTENT_PATTERN = /(review|revisa(?:r)?|analisa(?:r)?|audit|audita(?:r)?|feedback|avalia(?:r)?|check)/i
+const READ_INTENT_PATTERN = /(mostra(?:-me)?|show me|abre|open|l[eê]|read|conte[uú]do|content|ficheiro|file|lista completa|o que j[aá] est[aá] implementado|what(?:'s| is) implemented)/i
+const RUN_INTENT_PATTERN = /(run|executa(?:r)?|build|test(?:ar|e)?|lint|arranca|start|lan[çc]a|inicia)/i
+const QUESTION_LIKE_PATTERN = /(\?|^\s*(como|how|porque|porqu[eê]|why|what|o que|qual|quais|onde|when)\b)/i
+
+function classifyUserRequestIntent(text) {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) return 'unknown'
+
+  if (GUIDANCE_ABOUT_IMPLEMENTATION_PATTERN.test(normalized)) return 'explain'
+
+  const directImplementationRequest = DIRECT_IMPLEMENTATION_REQUEST_PATTERN.test(normalized)
+
+  if (REVIEW_INTENT_PATTERN.test(normalized) && !directImplementationRequest) return 'review'
+  if (READ_INTENT_PATTERN.test(normalized) && !directImplementationRequest) return 'read'
+  if (RUN_INTENT_PATTERN.test(normalized) && !directImplementationRequest) return 'run'
+  if (EXPLANATION_INTENT_PATTERN.test(normalized) && !directImplementationRequest) return 'explain'
+
+  if (directImplementationRequest) return 'implement'
+
+  if (IMPLEMENTATION_INTENT_PATTERN.test(normalized)) {
+    return QUESTION_LIKE_PATTERN.test(normalized) ? 'explain' : 'implement'
+  }
+
+  if (QUESTION_LIKE_PATTERN.test(normalized)) return 'explain'
+  return 'unknown'
+}
+
+function normalizeIterationBudget(value, fallback = 15) {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) return fallback
+  return Math.max(5, Math.min(Math.round(numericValue), 60))
+}
+
+function getIterationBudgetForIntent(intent, configuredBudget = 15) {
+  const budget = normalizeIterationBudget(configuredBudget, 15)
+
+  switch (intent) {
+    case 'implement':
+      return budget
+    case 'run':
+      return budget
+    case 'explain':
+    case 'read':
+    case 'review':
+      return budget
+    default:
+      return budget
+  }
+}
+
+function containsStandaloneCodeBlock(text) {
+  return /```[\s\S]*?```/.test(String(text || ''))
+}
+
+function looksLikePlanInsteadOfAction(text) {
+  const normalized = String(text || '').trim().toLowerCase()
+  if (!normalized) return false
+
+  return /(vou (corrigir|atualizar|adicionar|implementar)|vou primeiro (ver|analisar|inspecionar|verificar)|vou (ver|analisar|inspecionar|verificar) (o estado|os ficheiros|primeiro)|let me (first )?(check|inspect|review|look at)|i(?:'| wi)ll (first )?(check|inspect|review|look at)|here is the code|aqui est[áa] o c[oó]digo|para usar:|preencha as imagens|vou atualizar o projeto|os ficheiros corrigidos s[aã]o)/i.test(normalized)
+}
+
+function getToolCallDispatchGuardResult(toolName, rawArguments) {
+  const payload = String(rawArguments || '')
+  if (!payload) return null
+
+  if (payload.length > MAX_TOOL_ARGUMENT_PAYLOAD_LENGTH) {
+    return {
+      success: false,
+      error: `Tool arguments for ${toolName} exceed the safe main-process payload limit (${payload.length} chars).`,
+      message: `The arguments for ${toolName} are too large for safe main-process dispatch. Retry with a smaller patch or a narrower file write.`,
+    }
+  }
+
+  return null
+}
+
+function getIntentScopedToolGuardResult(toolName, toolArgs, runIntent, runState) {
+  if (!NON_EXECUTION_INTENT_NAMES.has(runIntent)) return null
+  if (runState?.successfulMutationCount > 0) return null
+
+  let validationKind = null
+
+  if (AUTO_RECOVERY_VALIDATION_TOOL_NAMES.has(toolName)) {
+    validationKind = toolName.replace(/^run_/, '')
+  } else if (toolName === 'run_command') {
+    validationKind = getValidationKindFromCommand(toolArgs?.command)
+  }
+
+  if (!validationKind) return null
+
+  return {
+    success: false,
+    error: `${toolName} is not appropriate for a ${runIntent} request without explicit execution intent.`,
+    message: `This request is ${runIntent}-only. Do not run ${validationKind}. Use list_directory, find_files, search_text, read_file, or read_file_range unless the user explicitly asked to build, test, lint, or run the project.`,
+  }
+}
+
+function getRunCommandInspectionBlockReason(command) {
+  const normalized = String(command || '').trim()
+  if (!normalized) return ''
+
+  if (/^(type|cat|more)\s+/i.test(normalized)) {
+    return 'Use read_file or read_file_range to inspect file contents instead of run_command.'
+  }
+
+  if (/^(get-content|gc)\s+/i.test(normalized)) {
+    return 'Use read_file or read_file_range to inspect file contents instead of run_command.'
+  }
+
+  if (/^(cmd(\.exe)?\s+\/c\s+type|powershell(\.exe)?\s+-(c|command)\s+"?(get-content|type)|pwsh\s+-(c|command)\s+"?(get-content|type))\b/i.test(normalized)) {
+    return 'Use read_file or read_file_range to inspect file contents instead of run_command.'
+  }
+
+  return ''
+}
+
+function shouldAutoRecoverValidationFailures(runIntent, runState) {
+  return runIntent === 'implement' || runState?.successfulMutationCount > 0
+}
+
+function isValidationToolExecution(toolName, result) {
+  return AUTO_RECOVERY_VALIDATION_TOOL_NAMES.has(toolName)
+    || (toolName === 'run_command' && Boolean(result?.validationKind))
+}
+
+function isFailedValidationToolExecution(toolName, result) {
+  return isValidationToolExecution(toolName, result)
+    && result?.success === false
+    && typeof result?.exitCode === 'number'
+    && result.exitCode !== 0
+}
+
+function isSuccessfulValidationToolExecution(toolName, result) {
+  return isValidationToolExecution(toolName, result) && Boolean(result?.success)
+}
+
+function getValidationFailureLog(result) {
+  const parts = []
+
+  if (result?.runner) parts.push(`Runner: ${result.runner}`)
+  if (result?.command) parts.push(`Command: ${result.command}`)
+  if (result?.workingDirectory) parts.push(`Working directory: ${result.workingDirectory}`)
+  if (typeof result?.exitCode === 'number') parts.push(`Exit code: ${result.exitCode}`)
+
+  const output = [result?.stderr, result?.stdout, result?.error]
+    .filter((value, index, array) => typeof value === 'string' && value.trim() && array.indexOf(value) === index)
+    .join('\n\n')
+    .trim()
+
+  if (output) {
+    parts.push('Output:')
+    parts.push(output)
+  }
+
+  return parts.join('\n').trim() || 'Validation failed without additional output.'
+}
+
+function getLastRegexMatch(pattern, text) {
+  if (!(pattern instanceof RegExp) || typeof text !== 'string' || !text) return null
+
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`
+  const matcher = new RegExp(pattern.source, flags)
+  let match = null
+  let current = matcher.exec(text)
+
+  while (current) {
+    match = current
+    current = matcher.exec(text)
+  }
+
+  return match
+}
+
+function getFirstRegexMatch(pattern, text) {
+  if (!(pattern instanceof RegExp) || typeof text !== 'string' || !text) return null
+  const flags = pattern.flags.includes('g') ? pattern.flags.replace(/g/g, '') : pattern.flags
+  const matcher = new RegExp(pattern.source, flags)
+  return matcher.exec(text)
+}
+
+function normalizeValidationFailurePath(rawPath, workingDirectory) {
+  if (typeof rawPath !== 'string' || !rawPath.trim()) return null
+
+  const trimmedPath = rawPath.trim().replace(/^['"(]+|['")]+$/g, '')
+  const normalizedWorkingDirectory = typeof workingDirectory === 'string' && workingDirectory.trim()
+    ? workingDirectory.trim()
+    : ''
+
+  const candidates = []
+
+  if (path.isAbsolute(trimmedPath)) {
+    candidates.push(path.normalize(trimmedPath))
+  }
+
+  if (normalizedWorkingDirectory) {
+    candidates.push(path.resolve(normalizedWorkingDirectory, trimmedPath))
+  }
+
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate
+      }
+    } catch {
+      continue
+    }
+  }
+
+  return candidates[0] || trimmedPath
+}
+
+function getValidationFailureMessage(output, fallback = 'Validation failed.') {
+  if (typeof output !== 'string' || !output.trim()) return fallback
+
+  const lines = output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+
+  const preferredLine = lines.find((line) => /(?:error|exception|failed|traceback|typeerror|referenceerror|syntaxerror|zerodivisionerror|assertionerror)/i.test(line))
+  return preferredLine || lines[0] || fallback
+}
+
+function buildValidationFailureTarget({ rawPath, lineNumber, columnNumber, message, source, workingDirectory }) {
+  const resolvedPath = normalizeValidationFailurePath(rawPath, workingDirectory)
+  const numericLine = Number(lineNumber)
+  const numericColumn = Number(columnNumber)
+
+  if (!resolvedPath || !Number.isFinite(numericLine) || numericLine < 1) return null
+
+  const displayPath = normalizedWorkingDirectoryPathForDisplay(resolvedPath, workingDirectory)
+  const startLine = Math.max(1, numericLine - 4)
+  const endLine = numericLine + 4
+
+  let excerpt = ''
+  let excerptEndLine = endLine
+
+  try {
+    const lines = fs.readFileSync(resolvedPath, 'utf-8').split(/\r?\n/)
+    excerptEndLine = Math.min(lines.length, endLine)
+    excerpt = lines
+      .slice(startLine - 1, excerptEndLine)
+      .map((line, index) => `${startLine + index}: ${line}`)
+      .join('\n')
+  } catch {
+    excerpt = ''
+  }
+
+  return {
+    source,
+    path: resolvedPath,
+    displayPath,
+    lineNumber: numericLine,
+    columnNumber: Number.isFinite(numericColumn) ? numericColumn : null,
+    message: message || 'Validation failed.',
+    startLine,
+    endLine: excerptEndLine,
+    excerpt,
+  }
+}
+
+function normalizedWorkingDirectoryPathForDisplay(targetPath, workingDirectory) {
+  if (typeof targetPath !== 'string' || !targetPath.trim()) return targetPath
+  if (typeof workingDirectory !== 'string' || !workingDirectory.trim()) return targetPath
+
+  try {
+    const relativePath = path.relative(workingDirectory, targetPath)
+    if (relativePath && !relativePath.startsWith('..') && !path.isAbsolute(relativePath)) {
+      return relativePath.split(path.sep).join('/')
+    }
+  } catch {
+    return targetPath
+  }
+
+  return targetPath
+}
+
+function parseValidationFailureTarget(result) {
+  const output = [result?.stderr, result?.stdout, result?.error]
+    .filter((value) => typeof value === 'string' && value.trim())
+    .join('\n')
+
+  if (!output) return null
+
+  const workingDirectory = typeof result?.workingDirectory === 'string' && result.workingDirectory.trim()
+    ? result.workingDirectory.trim()
+    : ''
+
+  const dotnetMatch = getFirstRegexMatch(/(?<path>(?:[A-Za-z]:)?[^()\r\n]+?\.(?:cs|fs|vb|xaml|razor|cshtml))\((?<line>\d+),(?<column>\d+)\):\s*(?<message>[^\r\n]+)/i, output)
+  if (dotnetMatch?.groups?.path) {
+    return buildValidationFailureTarget({
+      rawPath: dotnetMatch.groups.path,
+      lineNumber: dotnetMatch.groups.line,
+      columnNumber: dotnetMatch.groups.column,
+      message: dotnetMatch.groups.message,
+      source: 'dotnet',
+      workingDirectory,
+    })
+  }
+
+  const pythonMatch = getLastRegexMatch(/File\s+"(?<path>[^"]+?\.py)",\s+line\s+(?<line>\d+)(?:,\s+in\s+[^\r\n]+)?/i, output)
+  if (pythonMatch?.groups?.path) {
+    return buildValidationFailureTarget({
+      rawPath: pythonMatch.groups.path,
+      lineNumber: pythonMatch.groups.line,
+      columnNumber: null,
+      message: getValidationFailureMessage(output, 'Python traceback detected.'),
+      source: 'python',
+      workingDirectory,
+    })
+  }
+
+  const nodeStackMatch = getFirstRegexMatch(/\bat\s+(?:[^\r\n(]+\()?((?:[A-Za-z]:)?[^()\r\n]+?\.(?:[cm]?[jt]sx?|vue)):(\d+):(\d+)\)?/i, output)
+  if (nodeStackMatch?.[1]) {
+    return buildValidationFailureTarget({
+      rawPath: nodeStackMatch[1],
+      lineNumber: nodeStackMatch[2],
+      columnNumber: nodeStackMatch[3],
+      message: getValidationFailureMessage(output, 'Node.js stack trace detected.'),
+      source: 'node',
+      workingDirectory,
+    })
+  }
+
+  const genericFileMatch = getFirstRegexMatch(/(?<path>(?:[A-Za-z]:)?[^:\r\n]+?\.(?:[cm]?[jt]sx?|vue|py|cs|fs|vb)):(?<line>\d+)(?::(?<column>\d+))?/i, output)
+  if (genericFileMatch?.groups?.path) {
+    return buildValidationFailureTarget({
+      rawPath: genericFileMatch.groups.path,
+      lineNumber: genericFileMatch.groups.line,
+      columnNumber: genericFileMatch.groups.column,
+      message: getValidationFailureMessage(output, 'Validation failure location detected.'),
+      source: 'generic',
+      workingDirectory,
+    })
+  }
+
+  return null
+}
+
+function buildValidationRecoveryInstruction(failureState) {
+  const failureLog = truncatePreview(failureState?.failureLog || '', 4000)
+  const failureTarget = failureState?.target || null
+  const targetSummary = failureTarget
+    ? `Parsed failure target: ${failureTarget.message} at ${failureTarget.displayPath}:${failureTarget.lineNumber}${failureTarget.columnNumber ? `:${failureTarget.columnNumber}` : ''}.`
+    : ''
+  const targetReadInstruction = failureTarget
+    ? `Start with read_file_range on ${failureTarget.displayPath} lines ${failureTarget.startLine}-${failureTarget.endLine} before deciding on the fix.`
+    : ''
+  const targetExcerpt = failureTarget?.excerpt
+    ? `Relevant excerpt:\n\n\`\`\`text\n${truncatePreview(failureTarget.excerpt, 1600)}\n\`\`\``
+    : ''
+  return [
+    `Automatic recovery required: ${failureState?.toolName || 'validation'} failed (${failureState?.attempts || 1}/${MAX_AUTOMATIC_VALIDATION_RECOVERY_ATTEMPTS}).`,
+    'Do not stop, do not summarize the failure, and do not ask the user what to do next.',
+    'Read the failing output, inspect the relevant files or ranges, fix the root cause with file tools, then rerun the same validation tool.',
+    'Finish only after the validation passes or after the retry cap is reached.',
+    targetSummary,
+    targetReadInstruction,
+    targetExcerpt,
+    failureLog ? `Validation log:\n\n\`\`\`text\n${failureLog}\n\`\`\`` : ''
+  ].filter(Boolean).join('\n\n')
+}
+
+function shouldEnforceToolDrivenImplementation(userMessage, reply, runState) {
+  if (classifyUserRequestIntent(userMessage) !== 'implement') return false
+  if (runState?.successfulMutationCount > 0 && !runState?.pendingPostWriteVerification) return false
+
+  const text = String(reply || '').trim()
+  if (!text) return false
+
+  if (runState?.successfulMutationCount === 0) {
+    return containsStandaloneCodeBlock(text) || looksLikePlanInsteadOfAction(text)
+  }
+
+  return runState?.pendingPostWriteVerification
+}
+
 async function getGitHubRepoInfo(baseDir, runState) {
   const ready = await ensureGitHubRepoReady(baseDir, runState)
   if (!ready.success) return ready
@@ -2037,6 +2850,36 @@ async function getGitHubRepoInfo(baseDir, runState) {
     success: true,
     repoInfo: parsed.data,
     message: `Repository ${parsed.data.nameWithOwner} is ready on ${parsed.data.defaultBranchRef?.name || 'unknown branch'}.`,
+  }
+}
+
+async function getGitHubIssueList(baseDir, args, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const limit = Math.min(Math.max(Number(args?.limit) || 20, 1), 100)
+  const ghArgs = [
+    'issue',
+    'list',
+    '--limit',
+    String(limit),
+    '--json',
+    'number,title,state,labels,assignees,author,url',
+  ]
+
+  if (typeof args?.state === 'string' && args.state.trim()) ghArgs.push('--state', args.state.trim())
+  if (typeof args?.search === 'string' && args.search.trim()) ghArgs.push('--search', args.search.trim())
+  for (const label of normalizeGitHubCliList(args?.labels)) ghArgs.push('--label', label)
+  if (typeof args?.assignee === 'string' && args.assignee.trim()) ghArgs.push('--assignee', args.assignee.trim())
+  if (typeof args?.author === 'string' && args.author.trim()) ghArgs.push('--author', args.author.trim())
+
+  const parsed = parseGhJson(await runGhCommand(ghArgs, ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  return {
+    success: true,
+    issues: parsed.data,
+    message: parsed.data.length ? `Loaded ${parsed.data.length} GitHub issue(s).` : 'No GitHub issues matched the current filters.',
   }
 }
 
@@ -2188,6 +3031,39 @@ async function commentOnGitHubIssue(baseDir, args, runState) {
   }
 }
 
+async function getGitHubPullRequestList(baseDir, args, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const limit = Math.min(Math.max(Number(args?.limit) || 20, 1), 100)
+  const ghArgs = [
+    'pr',
+    'list',
+    '--limit',
+    String(limit),
+    '--json',
+    'number,title,state,isDraft,reviewDecision,author,headRefName,baseRefName,url',
+  ]
+
+  if (typeof args?.state === 'string' && args.state.trim()) ghArgs.push('--state', args.state.trim())
+  if (typeof args?.search === 'string' && args.search.trim()) ghArgs.push('--search', args.search.trim())
+  for (const label of normalizeGitHubCliList(args?.labels)) ghArgs.push('--label', label)
+  if (typeof args?.assignee === 'string' && args.assignee.trim()) ghArgs.push('--assignee', args.assignee.trim())
+  if (typeof args?.author === 'string' && args.author.trim()) ghArgs.push('--author', args.author.trim())
+  if (typeof args?.base === 'string' && args.base.trim()) ghArgs.push('--base', args.base.trim())
+  if (typeof args?.head === 'string' && args.head.trim()) ghArgs.push('--head', args.head.trim())
+  if (args?.draft === true) ghArgs.push('--draft')
+
+  const parsed = parseGhJson(await runGhCommand(ghArgs, ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  return {
+    success: true,
+    pullRequests: parsed.data,
+    message: parsed.data.length ? `Loaded ${parsed.data.length} GitHub pull request(s).` : 'No GitHub pull requests matched the current filters.',
+  }
+}
+
 async function getGitHubPullRequestView(baseDir, prNumber, runState) {
   const ready = await ensureGitHubRepoReady(baseDir, runState)
   if (!ready.success) return ready
@@ -2206,6 +3082,60 @@ async function getGitHubPullRequestView(baseDir, prNumber, runState) {
     success: true,
     pullRequest: parsed.data,
     message: `PR #${parsed.data.number}: ${parsed.data.title}`,
+  }
+}
+
+async function getGitHubPullRequestChecks(baseDir, prNumber, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const prResponse = parseGhJson(await runGhCommand(['api', `repos/${ready.status.repoSlug}/pulls/${prNumber}`], ready.status.repoRoot, runState))
+  if (!prResponse.success) return prResponse
+
+  const headSha = prResponse.data?.head?.sha
+  if (!headSha) {
+    return { success: false, error: `PR #${prNumber} is missing a head SHA.` }
+  }
+
+  const statusResponse = parseGhJson(await runGhCommand(['api', `repos/${ready.status.repoSlug}/commits/${headSha}/status`], ready.status.repoRoot, runState))
+  if (!statusResponse.success) return statusResponse
+
+  const checkRunsResponse = parseGhJson(await runGhCommand([
+    'api',
+    `repos/${ready.status.repoSlug}/commits/${headSha}/check-runs`,
+    '-H',
+    'Accept: application/vnd.github+json',
+  ], ready.status.repoRoot, runState))
+  if (!checkRunsResponse.success) return checkRunsResponse
+
+  const failingChecks = (checkRunsResponse.data?.check_runs || [])
+    .filter((run) => ['failure', 'timed_out', 'cancelled', 'action_required', 'startup_failure', 'stale'].includes(String(run.conclusion || '').toLowerCase()))
+    .map((run) => ({ name: run.name, status: run.status, conclusion: run.conclusion, url: run.html_url }))
+
+  return {
+    success: true,
+    pullRequest: {
+      number: prResponse.data.number,
+      title: prResponse.data.title,
+      state: prResponse.data.state,
+      draft: Boolean(prResponse.data.draft),
+      mergeable: prResponse.data.mergeable,
+      mergeableState: prResponse.data.mergeable_state || '',
+      requestedReviewers: Array.isArray(prResponse.data.requested_reviewers) ? prResponse.data.requested_reviewers.map((reviewer) => reviewer?.login).filter(Boolean) : [],
+      headSha,
+      url: prResponse.data.html_url || '',
+    },
+    statusChecks: {
+      state: statusResponse.data?.state || 'unknown',
+      total: Array.isArray(statusResponse.data?.statuses) ? statusResponse.data.statuses.length : 0,
+      statuses: statusResponse.data?.statuses || [],
+    },
+    checkRuns: {
+      total: Number(checkRunsResponse.data?.total_count) || 0,
+      runs: checkRunsResponse.data?.check_runs || [],
+      failing: failingChecks,
+    },
+    message: failingChecks.length ? `PR #${prNumber} has ${failingChecks.length} failing check run(s).` : `Loaded merge readiness and status checks for PR #${prNumber}.`,
   }
 }
 
@@ -2229,11 +3159,61 @@ async function getGitHubPullRequestReviewComments(baseDir, prNumber, runState) {
   }
 }
 
+async function getGitHubPullRequestReviewThreads(baseDir, prNumber, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const repoParts = parseGitHubRepoParts(ready.status.repoSlug)
+  if (!repoParts) {
+    return { success: false, error: 'Unable to parse the GitHub repository owner/name.' }
+  }
+
+  const query = `query($owner:String!, $name:String!, $number:Int!) {
+    repository(owner:$owner, name:$name) {
+      pullRequest(number:$number) {
+        reviewThreads(first:100) {
+          nodes {
+            id
+            isResolved
+            isOutdated
+            path
+            line
+            originalLine
+            comments(first:20) {
+              nodes {
+                databaseId
+                body
+                url
+                createdAt
+                author {
+                  login
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }`
+
+  const parsed = parseGhJson(await runGhGraphQl(query, { owner: repoParts.owner, name: repoParts.name, number: Number(prNumber) }, ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  const threads = parsed.data?.data?.repository?.pullRequest?.reviewThreads?.nodes || []
+  return {
+    success: true,
+    threads,
+    message: threads.length ? `Loaded ${threads.length} review thread(s) for PR #${prNumber}.` : `No review threads found for PR #${prNumber}.`,
+  }
+}
+
 async function editGitHubPullRequest(baseDir, args, runState) {
   const ready = await ensureGitHubRepoReady(baseDir, runState)
   if (!ready.success) return ready
 
   const ghArgs = ['pr', 'edit', String(args.number)]
+  const addReviewers = normalizeGitHubCliList(args.addReviewers)
+  const removeReviewers = normalizeGitHubCliList(args.removeReviewers)
 
   if (hasToolArg(args, 'title')) {
     ghArgs.push('--title', String(args.title ?? ''))
@@ -2263,17 +3243,39 @@ async function editGitHubPullRequest(baseDir, args, runState) {
     ghArgs.push('--remove-assignee', assignee)
   }
 
-  if (ghArgs.length === 3) {
+  if (ghArgs.length === 3 && !addReviewers.length && !removeReviewers.length) {
     return { success: false, error: 'Provide at least one PR field to edit.' }
   }
 
-  const result = await runGhCommand(ghArgs, ready.status.repoRoot, runState)
-  if (result.cancelled) return result
-  if (!result.success) return result
+  if (ghArgs.length > 3) {
+    const result = await runGhCommand(ghArgs, ready.status.repoRoot, runState)
+    if (result.cancelled) return result
+    if (!result.success) return result
+  }
+
+  if (addReviewers.length) {
+    const addArgs = ['api', '-X', 'POST', `repos/${ready.status.repoSlug}/pulls/${args.number}/requested_reviewers`]
+    for (const reviewer of addReviewers) {
+      addArgs.push('-f', `reviewers[]=${reviewer}`)
+    }
+    const addResult = await runGhCommand(addArgs, ready.status.repoRoot, runState)
+    if (addResult.cancelled) return addResult
+    if (!addResult.success) return addResult
+  }
+
+  if (removeReviewers.length) {
+    const removeArgs = ['api', '-X', 'DELETE', `repos/${ready.status.repoSlug}/pulls/${args.number}/requested_reviewers`]
+    for (const reviewer of removeReviewers) {
+      removeArgs.push('-f', `reviewers[]=${reviewer}`)
+    }
+    const removeResult = await runGhCommand(removeArgs, ready.status.repoRoot, runState)
+    if (removeResult.cancelled) return removeResult
+    if (!removeResult.success) return removeResult
+  }
 
   return {
     success: true,
-    stdout: result.stdout,
+    reviewersUpdated: Boolean(addReviewers.length || removeReviewers.length),
     message: `PR #${args.number} updated successfully.`,
   }
 }
@@ -2363,6 +3365,51 @@ async function commentOnGitHubPullRequest(baseDir, args, runState) {
   }
 }
 
+async function replyToGitHubPullRequestReviewThread(baseDir, args, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const parsed = parseGhJson(await runGhCommand([
+    'api',
+    '-X',
+    'POST',
+    `repos/${ready.status.repoSlug}/pulls/${args.number}/comments/${args.commentId}/replies`,
+    '-f',
+    `body=${String(args.body || '').trim()}`,
+  ], ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  return {
+    success: true,
+    reply: parsed.data,
+    message: parsed.data?.html_url ? `Reply added to PR #${args.number} review thread: ${parsed.data.html_url}` : `Reply added to PR #${args.number} review thread.`,
+  }
+}
+
+async function updateGitHubPullRequestReviewThreadResolution(baseDir, args, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  const mutationName = args.resolved ? 'resolveReviewThread' : 'unresolveReviewThread'
+  const query = `mutation($threadId:ID!) {
+    ${mutationName}(input:{threadId:$threadId}) {
+      thread {
+        id
+        isResolved
+      }
+    }
+  }`
+
+  const parsed = parseGhJson(await runGhGraphQl(query, { threadId: String(args.threadId || '') }, ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  return {
+    success: true,
+    thread: parsed.data?.data?.[mutationName]?.thread || null,
+    message: args.resolved ? 'Review thread resolved.' : 'Review thread unresolved.',
+  }
+}
+
 async function mergeGitHubPullRequest(baseDir, args, runState) {
   const ready = await ensureGitHubRepoReady(baseDir, runState)
   if (!ready.success) return ready
@@ -2408,6 +3455,49 @@ async function mergeGitHubPullRequest(baseDir, args, runState) {
     success: true,
     stdout: result.stdout,
     message: `PR #${args.number} merge requested with ${normalizedMethod}.`,
+  }
+}
+
+async function setGitHubPullRequestReadyState(baseDir, args, runState) {
+  const ready = await ensureGitHubRepoReady(baseDir, runState)
+  if (!ready.success) return ready
+
+  if (args.ready !== false) {
+    const result = await runGhCommand(['pr', 'ready', String(args.number)], ready.status.repoRoot, runState)
+    if (result.cancelled) return result
+    if (!result.success) return result
+
+    return {
+      success: true,
+      stdout: result.stdout,
+      message: `PR #${args.number} marked ready for review.`,
+    }
+  }
+
+  const prResponse = parseGhJson(await runGhCommand(['api', `repos/${ready.status.repoSlug}/pulls/${args.number}`], ready.status.repoRoot, runState))
+  if (!prResponse.success) return prResponse
+
+  const pullRequestId = prResponse.data?.node_id
+  if (!pullRequestId) {
+    return { success: false, error: `PR #${args.number} is missing a node ID.` }
+  }
+
+  const query = `mutation($pullRequestId:ID!) {
+    convertPullRequestToDraft(input:{pullRequestId:$pullRequestId}) {
+      pullRequest {
+        number
+        isDraft
+      }
+    }
+  }`
+
+  const parsed = parseGhJson(await runGhGraphQl(query, { pullRequestId }, ready.status.repoRoot, runState))
+  if (!parsed.success) return parsed
+
+  return {
+    success: true,
+    pullRequest: parsed.data?.data?.convertPullRequestToDraft?.pullRequest || null,
+    message: `PR #${args.number} converted to draft.`,
   }
 }
 
@@ -2816,6 +3906,7 @@ async function searchTextTool(baseDir, args) {
 function executeTool(name, args, workingDir, onProgress, runState) {
   return new Promise((resolve) => {
     try {
+      name = normalizeRequestedToolName(name)
       const baseDir = workingDir || process.cwd()
       ensureRunNotCancelled(runState)
 
@@ -2918,6 +4009,17 @@ function executeTool(name, args, workingDir, onProgress, runState) {
         }
         case 'run_command': {
           const commandCwd = args.cwd ? resolveToolPath(baseDir, args.cwd) : baseDir
+          const inspectionBlockReason = getRunCommandInspectionBlockReason(args.command)
+          if (inspectionBlockReason) {
+            resolve({
+              success: false,
+              error: inspectionBlockReason,
+              message: inspectionBlockReason,
+              blockedCommand: args.command || '',
+            })
+            break
+          }
+
           const validationKind = getValidationKindFromCommand(args.command)
           if (validationKind) {
             runValidationTool(validationKind, commandCwd, getValidationTargetFromCommand(args.command), runState)
@@ -2929,12 +4031,12 @@ function executeTool(name, args, workingDir, onProgress, runState) {
             break
           }
 
-          runExecCommand(args.command, { cwd: commandCwd, timeout: 30000 }, runState, (err, stdout, stderr) => ({
+          runExecCommand(args.command, { cwd: commandCwd, timeout: 30000, maxBuffer: 256 * 1024 }, runState, (err, stdout, stderr) => ({
             success: !err,
-            stdout: stdout || '',
-            stderr: stderr || '',
+            stdout: truncatePreview(stdout || '', 12000),
+            stderr: truncatePreview(stderr || '', 12000),
             exitCode: err?.code || 0,
-            error: err ? (stderr || stdout || err.message || 'Command failed').trim() : null,
+            error: err ? truncatePreview((stderr || stdout || err.message || 'Command failed').trim(), 12000) : null,
           })).then(resolve)
           break
         }
@@ -2995,6 +4097,10 @@ function executeTool(name, args, workingDir, onProgress, runState) {
           getGitHubRepoInfo(baseDir, runState).then(resolve)
           break
         }
+        case 'github_issue_list': {
+          getGitHubIssueList(baseDir, args, runState).then(resolve)
+          break
+        }
         case 'github_issue_view': {
           getGitHubIssueView(baseDir, args.number, runState).then(resolve)
           break
@@ -3019,12 +4125,24 @@ function executeTool(name, args, workingDir, onProgress, runState) {
           commentOnGitHubIssue(baseDir, args, runState).then(resolve)
           break
         }
+        case 'github_pr_list': {
+          getGitHubPullRequestList(baseDir, args, runState).then(resolve)
+          break
+        }
         case 'github_pr_view': {
           getGitHubPullRequestView(baseDir, args.number, runState).then(resolve)
           break
         }
+        case 'github_pr_checks': {
+          getGitHubPullRequestChecks(baseDir, args.number, runState).then(resolve)
+          break
+        }
         case 'github_pr_review_comments': {
           getGitHubPullRequestReviewComments(baseDir, args.number, runState).then(resolve)
+          break
+        }
+        case 'github_pr_review_threads': {
+          getGitHubPullRequestReviewThreads(baseDir, args.number, runState).then(resolve)
           break
         }
         case 'github_pr_edit': {
@@ -3033,6 +4151,14 @@ function executeTool(name, args, workingDir, onProgress, runState) {
         }
         case 'github_pr_review_submit': {
           submitGitHubPullRequestReview(baseDir, args, runState).then(resolve)
+          break
+        }
+        case 'github_pr_review_thread_reply': {
+          replyToGitHubPullRequestReviewThread(baseDir, args, runState).then(resolve)
+          break
+        }
+        case 'github_pr_review_thread_resolve': {
+          updateGitHubPullRequestReviewThreadResolution(baseDir, args, runState).then(resolve)
           break
         }
         case 'github_pr_close': {
@@ -3049,6 +4175,10 @@ function executeTool(name, args, workingDir, onProgress, runState) {
         }
         case 'github_pr_merge': {
           mergeGitHubPullRequest(baseDir, args, runState).then(resolve)
+          break
+        }
+        case 'github_pr_ready': {
+          setGitHubPullRequestReadyState(baseDir, args, runState).then(resolve)
           break
         }
         case 'github_pr_create': {
@@ -3541,11 +4671,14 @@ async function callProvider(messages, apiKey, provider, runState, onAssistantCon
 
 // ─── Agentic Loop ─────────────────────────────────────────────────────────────
 
-ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workingDir, provider, runId }) => {
+ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workingDir, provider, runId, chatId, approvalPolicy, iterationBudget }) => {
   const resolvedRunId = runId || `run-${Date.now()}`
   const resolvedProvider = provider || 'openrouter'
   const runKey = getAgentRunKey(event.sender.id, resolvedRunId)
   const providerCursorKey = getProviderCursorKey(event.sender.id, resolvedProvider)
+  const resolvedApprovalPolicy = chatId
+    ? setStoredChatApprovalPolicy(event.sender.id, chatId, approvalPolicy || getStoredChatApprovalPolicy(event.sender.id, chatId))
+    : normalizeApprovalPolicy(approvalPolicy)
 
   if (!Array.isArray(history) || history.length === 0) {
     resetProviderModelCursor(providerCursorKey)
@@ -3553,13 +4686,22 @@ ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workin
 
   const runState = {
     runId: resolvedRunId,
+    chatId: chatId || '',
     cancelled: false,
     activeRequest: null,
     activeWorker: null,
     pendingApproval: null,
+    approvalPolicy: resolvedApprovalPolicy,
     activeToolName: '',
     toolCancellation: { requested: false, toolName: '' },
     discovery: createRunDiscoveryState(),
+    successfulMutationCount: 0,
+    successfulVerificationCount: 0,
+    pendingPostWriteVerification: false,
+    toolEnforcementAttempts: 0,
+    validationRecoveryAttempts: 0,
+    pendingValidationRecovery: false,
+    lastValidationFailure: null,
     providerCursorKey,
   }
   activeAgentRuns.set(runKey, runState)
@@ -3591,12 +4733,24 @@ Prefer find_files, search_text, read_file_range, and apply_patch over broad rewr
 After making code changes, prefer run_build, run_test, or run_lint before using raw shell commands.
 Use git_status and git_diff before git_add or git_commit when preparing repository changes.
 If a git tool reports that the working directory is not inside a git repository, stop and tell the user instead of probing the filesystem for .git.
-When read_file or read_file_range is used, state only that the content is available via the inspector button instead of pasting raw file contents into chat. Do not mention privacy, security, policy, or data protection reasons. Summarize briefly or ask what section they want.
+You are an autonomous coding agent with file system tools.
+When asked to fix or implement code, follow this loop: inspect the relevant files, make the change with tools, then verify with read_file, git_diff, run_build, run_test, or run_lint before finishing when a suitable check exists.
+If run_build, run_test, run_lint, or a validation-routed run_command fails with a non-zero exit code during a coding task, treat that as an expected intermediate state: read the error output, inspect the relevant code, fix the issue, and rerun validation without waiting for user input.
+Do not stop after a failed validation until it passes or you have already tried to recover three times in the current run.
+For read-only, explanation, review, or listing requests, do not run build, test, lint, or validation commands unless the user explicitly asked to execute them or you already made a code change that genuinely needs verification.
+Never use run_command to print or inspect file contents. Use read_file, read_file_range, list_directory, or search_text for workspace inspection.
+You MUST use file writing tools to implement requested code changes. Responding with code in plain text without calling write tools is a task failure.
+Never explain what you would do instead of doing it.
+Never return full replacement code blocks as your final response for a coding task when file tools are available.
+When read_file or read_file_range is used, state only that the content is available via the inspector button instead of pasting raw file contents into chat. Do not mention privacy, security, policy, or data protection reasons. Summarize briefly and keep moving the task forward when the request is actionable. Ask what section the user wants only when they asked for explanation or you are genuinely blocked.
 When changing an existing project, ground every edit in files that actually exist in the workspace.
 Do not invent file names, class names, component names, page names, form names, routes, selectors, commands, or entrypoints.
 Before editing, identify the relevant existing files by using find_files, search_text, read_file, or read_file_range, then base the change on what is actually present.
 If the request refers to a startup flow, main screen, entrypoint, or app shell, first locate the real bootstrap and entry files for that project, then edit the concrete target instead of guessing.
 If multiple plausible targets exist, inspect them briefly and choose the one that directly controls the requested behavior. If no matching file or symbol exists, say so plainly instead of assuming a default.
+After you have enough context for a reasonable implementation, implement directly instead of asking for confirmation.
+Do not ask how to proceed, whether to continue, or what the user prefers unless there is a genuine blocker, a missing file, or multiple incompatible interpretations that would lead to materially different implementations.
+Prefer act -> show -> ask only if stuck.
 Working directory: ${workingDir || process.cwd()}
 Be concise, precise, and always explain what you're doing before doing it.
 When writing code, follow the existing patterns in the codebase.`
@@ -3606,17 +4760,20 @@ When writing code, follow the existing patterns in the codebase.`
   ]
 
   let iterations = 0
-  const MAX_ITERATIONS = 20
+  const runIntent = classifyUserRequestIntent(userMessage)
+  const configuredIterationBudget = normalizeIterationBudget(iterationBudget, 15)
+  let maxIterations = getIterationBudgetForIntent(runIntent, configuredIterationBudget)
 
   try {
-    while (iterations < MAX_ITERATIONS) {
+    while (iterations < maxIterations) {
       iterations++
       ensureRunNotCancelled(runState)
       runState.partialAssistantText = ''
       runState.lastEmittedAssistantText = ''
 
+      sendUpdate({ type: 'iteration', current: iterations, max: maxIterations, intent: runIntent })
       sendUpdate({ type: 'thinking', text: 'A pensar...' })
-      logMain('agent iteration', iterations)
+      logMain('agent iteration', { current: iterations, max: maxIterations, intent: runIntent })
 
       let response
       try {
@@ -3663,6 +4820,12 @@ When writing code, follow the existing patterns in the codebase.`
         hasContent: Boolean(message?.content),
         toolCallCount: message?.tool_calls?.length || 0
       })
+      sendUpdate({
+        type: 'model_response',
+        finishReason: choice.finish_reason || 'unknown',
+        hasContent: Boolean(message?.content),
+        toolCallCount: message?.tool_calls?.length || 0,
+      })
 
       if (message.tool_calls && message.tool_calls.length > 0) {
         let continueAgentLoop = false
@@ -3670,17 +4833,88 @@ When writing code, follow the existing patterns in the codebase.`
         for (const toolCall of message.tool_calls) {
           ensureRunNotCancelled(runState)
 
-          const toolName = toolCall.function.name
+          const toolName = normalizeRequestedToolName(toolCall.function.name)
+          const rawToolArguments = toolCall.function.arguments || '{}'
           let toolArgs = {}
 
-          try {
-            toolArgs = JSON.parse(toolCall.function.arguments || '{}')
-          } catch (e) {
-            logMain('Invalid tool arguments', toolCall.function.arguments)
-            return toIpcSafe({ success: false, error: `Invalid tool arguments for ${toolName}: ${e.message}` })
+          const dispatchGuardResult = getToolCallDispatchGuardResult(toolName, rawToolArguments)
+          if (dispatchGuardResult) {
+            logMain('tool call blocked by dispatch guard', {
+              toolName,
+              payloadLength: String(rawToolArguments || '').length,
+            })
+
+            latestToolResult = { toolName, toolArgs: {}, result: dispatchGuardResult }
+            sendUpdate({ type: 'tool', tool: toolName, args: {} })
+            sendUpdate({ type: 'tool_result', tool: toolName, result: dispatchGuardResult })
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: buildToolResultForModel(toolName, {}, dispatchGuardResult)
+            })
+
+            continueAgentLoop = true
+            break
+          }
+
+          const parsedToolArgs = parseToolArguments(toolName, rawToolArguments)
+          if (!parsedToolArgs.success) {
+            const invalidArgsResult = {
+              success: false,
+              error: `Invalid tool arguments for ${toolName}: ${parsedToolArgs.error}`,
+              message: `The arguments for ${toolName} were not valid JSON. Retry with a strict JSON object only.`,
+            }
+
+            logMain('Invalid tool arguments', {
+              toolName,
+              rawArguments: toolCall.function.arguments,
+              error: parsedToolArgs.error,
+            })
+
+            latestToolResult = { toolName, toolArgs: {}, result: invalidArgsResult }
+            sendUpdate({ type: 'tool', tool: toolName, args: {} })
+            sendUpdate({ type: 'tool_result', tool: toolName, result: invalidArgsResult })
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: buildToolResultForModel(toolName, {}, invalidArgsResult)
+            })
+
+            continueAgentLoop = true
+            break
+          }
+
+          toolArgs = parsedToolArgs.args
+
+          const intentScopedGuardResult = getIntentScopedToolGuardResult(toolName, toolArgs, runIntent, runState)
+          if (intentScopedGuardResult) {
+            logMain('tool call blocked by intent guard', {
+              toolName,
+              runIntent,
+            })
+
+            latestToolResult = { toolName, toolArgs, result: intentScopedGuardResult }
+            sendUpdate({ type: 'tool', tool: toolName, args: toolArgs })
+            sendUpdate({ type: 'tool_result', tool: toolName, result: intentScopedGuardResult })
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: buildToolResultForModel(toolName, toolArgs, intentScopedGuardResult)
+            })
+
+            continueAgentLoop = true
+            break
           }
 
           sendUpdate({ type: 'tool', tool: toolName, args: toolArgs })
+
+          if (MUTATING_TOOL_NAMES.has(toolName) && maxIterations < configuredIterationBudget) {
+            maxIterations = configuredIterationBudget
+            sendUpdate({ type: 'iteration', current: iterations, max: maxIterations, intent: runIntent })
+          }
 
           const approvalDecision = await requestToolApproval(runState, sendUpdate, workingDir || process.cwd(), toolName, toolArgs)
           if (approvalDecision.cancelled || runState.cancelled) {
@@ -3745,6 +4979,22 @@ When writing code, follow the existing patterns in the codebase.`
 
           recordToolDiscovery(runState, workingDir || process.cwd(), toolName, toolArgs, result)
 
+          if (result.success) {
+            if (MUTATING_TOOL_NAMES.has(toolName)) {
+              runState.successfulMutationCount += 1
+              runState.pendingPostWriteVerification = true
+            } else if (runState.pendingPostWriteVerification && VERIFICATION_TOOL_NAMES.has(toolName)) {
+              runState.successfulVerificationCount += 1
+              runState.pendingPostWriteVerification = false
+            }
+
+            if (isSuccessfulValidationToolExecution(toolName, result)) {
+              runState.validationRecoveryAttempts = 0
+              runState.pendingValidationRecovery = false
+              runState.lastValidationFailure = null
+            }
+          }
+
           if (result.toolCancelled) {
             sendUpdate({ type: 'tool_result', tool: toolName, result })
             logMain('tool cancelled', toolName)
@@ -3771,6 +5021,34 @@ When writing code, follow the existing patterns in the codebase.`
             tool_call_id: toolCall.id,
             content: buildToolResultForModel(toolName, toolArgs, result)
           })
+
+          if (isFailedValidationToolExecution(toolName, result) && shouldAutoRecoverValidationFailures(runIntent, runState)) {
+            runState.validationRecoveryAttempts += 1
+            runState.pendingValidationRecovery = true
+            const validationFailureTarget = parseValidationFailureTarget(result)
+            runState.lastValidationFailure = {
+              toolName,
+              validationKind: result.validationKind || toolName.replace(/^run_/, ''),
+              attempts: runState.validationRecoveryAttempts,
+              failureLog: getValidationFailureLog(result),
+              target: validationFailureTarget,
+            }
+
+            if (runState.validationRecoveryAttempts >= MAX_AUTOMATIC_VALIDATION_RECOVERY_ATTEMPTS) {
+              return toIpcSafe({
+                success: false,
+                error: `Automatic validation recovery failed after ${runState.validationRecoveryAttempts} attempts.\n\n${runState.lastValidationFailure.failureLog}`,
+              })
+            }
+
+            messages.push({
+              role: 'user',
+              content: buildValidationRecoveryInstruction(runState.lastValidationFailure)
+            })
+
+            continueAgentLoop = true
+            break
+          }
         }
 
         if (continueAgentLoop) {
@@ -3783,6 +5061,35 @@ When writing code, follow the existing patterns in the codebase.`
       const reply = normalizeMessageContent(message.content)
 
       if (reply) {
+        if (runState.pendingValidationRecovery && runState.lastValidationFailure) {
+          messages.push({
+            role: 'user',
+            content: buildValidationRecoveryInstruction(runState.lastValidationFailure)
+          })
+          continue
+        }
+
+        if (shouldEnforceToolDrivenImplementation(userMessage, reply, runState)) {
+          runState.toolEnforcementAttempts += 1
+
+          if (runState.toolEnforcementAttempts >= 2) {
+            return toIpcSafe({
+              success: false,
+              error: runState.successfulMutationCount > 0
+                ? 'The model stopped after describing changes without completing a verification step. It must verify the written changes before finishing.'
+                : 'The model responded with text/code instead of using file tools to implement the requested change.',
+            })
+          }
+
+          messages.push({
+            role: 'user',
+            content: runState.successfulMutationCount > 0
+              ? 'Tool-use correction: you already changed files. Do not finish yet. Verify the change with read_file, git_diff, run_build, run_test, or run_lint, then give a brief summary.'
+              : 'Tool-use correction: do not output code blocks or describe hypothetical edits. Use the available file tools to make the change directly, then verify and summarize briefly.',
+          })
+          continue
+        }
+
         logMain('agent:run complete', {
           replyLength: reply.length,
           replyPreview: reply.slice(0, 200),
@@ -3812,11 +5119,38 @@ When writing code, follow the existing patterns in the codebase.`
         return toIpcSafe({ success: false, error: 'Model returned an empty response' })
       }
 
-      break
+      if (choice.finish_reason === 'length') {
+        messages.push({
+          role: 'user',
+          content: 'The previous response was truncated by the model. Continue from the current task state without restarting. Either call the next tool or finish briefly if the task is actually complete.',
+        })
+        continue
+      }
+
+      const unexpectedFinishReason = choice.finish_reason || 'unknown'
+      logMain('agent loop ended with unhandled finish reason', {
+        finishReason: unexpectedFinishReason,
+        current: iterations,
+        max: maxIterations,
+      })
+      return toIpcSafe({
+        success: false,
+        error: `Model stopped unexpectedly with finish reason "${unexpectedFinishReason}" (${iterations}/${maxIterations}).`,
+      })
+
     }
 
-    logMain('agent loop exceeded max iterations')
-    return toIpcSafe({ success: false, error: 'Max iterations reached' })
+    logMain('agent loop exceeded max iterations', { current: iterations, max: maxIterations, intent: runIntent })
+    return toIpcSafe({
+      success: false,
+      continuationRequired: true,
+      error: `Iteration budget reached (${iterations}/${maxIterations}).`,
+      messages: messages.slice(1),
+      currentIterations: iterations,
+      maxIterations,
+      continuationBudget: configuredIterationBudget,
+      continuationPrompt: 'Continue the previous task from the current state until the requested work is fully complete. Use another full iteration budget and only finish once the requested outcome is actually done or a genuine blocker remains.',
+    })
   } catch (error) {
     if (isAgentCancellationError(error)) {
       logMain('Agent run cancelled')
@@ -3868,7 +5202,7 @@ ipcMain.handle('agent:cancel-tool', async (event, { runId } = {}) => {
   })
 })
 
-ipcMain.handle('agent:approval-response', async (event, { runId, requestId, approved } = {}) => {
+ipcMain.handle('agent:approval-response', async (event, { runId, requestId, approved, scope, chatId } = {}) => {
   if (!runId || !requestId) {
     return toIpcSafe({ success: false, error: 'runId and requestId are required' })
   }
@@ -3885,8 +5219,30 @@ ipcMain.handle('agent:approval-response', async (event, { runId, requestId, appr
 
   const pendingApproval = runState.pendingApproval
   runState.pendingApproval = null
+
+  if (approved) {
+    const nextApprovalPolicy = buildApprovalPolicyForScope(runState.approvalPolicy, pendingApproval.toolName, scope)
+    runState.approvalPolicy = nextApprovalPolicy
+
+    const resolvedChatId = chatId || runState.chatId
+    if (resolvedChatId) {
+      setStoredChatApprovalPolicy(event.sender.id, resolvedChatId, nextApprovalPolicy)
+      syncApprovalPolicyToActiveRuns(event.sender.id, resolvedChatId, nextApprovalPolicy)
+    }
+  }
+
   pendingApproval.resolve({ approved: Boolean(approved), cancelled: false, requestId })
   return toIpcSafe({ success: true, message: approved ? 'Approval granted.' : 'Approval denied.' })
+})
+
+ipcMain.handle('agent:set-approval-policy', async (event, { chatId, approvalPolicy } = {}) => {
+  if (!chatId) {
+    return toIpcSafe({ success: false, error: 'chatId is required' })
+  }
+
+  const normalizedPolicy = setStoredChatApprovalPolicy(event.sender.id, chatId, approvalPolicy)
+  syncApprovalPolicyToActiveRuns(event.sender.id, chatId, normalizedPolicy)
+  return toIpcSafe({ success: true, approvalPolicy: normalizedPolicy })
 })
 
 // ─── File Picker ──────────────────────────────────────────────────────────────

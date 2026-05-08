@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   cancelAgentRun: (payload) => ipcRenderer.invoke('agent:cancel', toIpcSafe(payload)),
   cancelAgentTool: (payload) => ipcRenderer.invoke('agent:cancel-tool', toIpcSafe(payload)),
   respondToApproval: (payload) => ipcRenderer.invoke('agent:approval-response', toIpcSafe(payload)),
+  setApprovalPolicy: (payload) => ipcRenderer.invoke('agent:set-approval-policy', toIpcSafe(payload)),
   previewFile: (payload) => ipcRenderer.invoke('file:preview', toIpcSafe(payload)),
   getGitHubStatus: (payload) => ipcRenderer.invoke('github:status', toIpcSafe(payload)),
   startGitHubLogin: (payload) => ipcRenderer.invoke('github:login', toIpcSafe(payload)),

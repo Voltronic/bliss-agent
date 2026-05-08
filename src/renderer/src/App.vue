@@ -172,7 +172,7 @@
                 <template v-else-if="msg.type === 'assistant'">
                   <div class="msg-avatar agent-avatar">◈</div>
                   <div class="msg-body">
-                    <div class="msg-text" :class="{ streaming: msg.isStreaming }" v-html="renderMarkdown(msg.content)"></div>
+                    <div class="msg-text" :class="{ streaming: msg.isStreaming }" v-html="renderMarkdown(msg.content)" @click="handleAssistantContentClick($event, msg)"></div>
                   </div>
                 </template>
 
@@ -221,16 +221,21 @@
                     <div v-if="!msg.result && msg.progress?.message" class="tool-call-progress">{{ msg.progress.message }}</div>
                     <div v-if="msg.result" class="tool-call-result" :class="{ error: !msg.result.success, expanded: isToolResultExpanded(msg) }">
                       <template v-if="visibleToolResultItems(msg).length">
-                        <button
+                        <component
                           v-for="item in visibleToolResultItems(msg)"
                           :key="`${msg.tool}-${item.path}-${item.lineNumber || 0}`"
+                          :is="item.previewable === false ? 'div' : 'button'"
                           class="tool-result-item"
-                          @click="openPreview(item)"
+                          :class="{ clickable: item.previewable !== false }"
+                          @click="handleToolResultItemClick(item)"
                         >
-                          <span class="tool-result-item-path">{{ item.path }}</span>
+                          <span class="tool-result-item-main">
+                            <span class="tool-result-item-icon">{{ getToolResultItemIcon(item) }}</span>
+                            <span class="tool-result-item-path">{{ getToolResultItemLabel(item) }}</span>
+                          </span>
                           <span v-if="item.lineNumber" class="tool-result-item-line">L{{ item.lineNumber }}</span>
                           <span v-if="item.line" class="tool-result-item-text">{{ item.line }}</span>
-                        </button>
+                        </component>
                       </template>
                       <template v-else>
                         {{ formatToolResult(msg.result) }}
@@ -248,6 +253,7 @@
                           <span class="workflow-inline-summary">{{ getWorkflowSummaryLine(msg.turnId) }}</span>
                         </div>
                         <div class="workflow-inline-meta">
+                          <span v-if="getWorkflowIterationLabel(msg.turnId)" class="workflow-inline-iteration">{{ getWorkflowIterationLabel(msg.turnId) }}</span>
                           <span class="workflow-inline-state">{{ getWorkflowStateLabel(msg.turnId) }}</span>
                           <span class="workflow-inline-chevron">{{ isWorkflowExpanded(msg.turnId) ? '−' : '+' }}</span>
                         </div>
@@ -365,7 +371,20 @@
                 </button>
               </div>
             </div>
-            <div class="input-hint">{{ composerHint }}</div>
+            <div class="input-hint-row">
+              <div class="input-hint">{{ composerHint }}</div>
+              <div class="context-meter-inline" :class="contextMeterTone" :title="contextMeterSummary">
+                <span class="context-meter-inline-label">Context</span>
+                <div class="context-meter-inline-bar">
+                  <span class="context-meter-inline-fill" :style="{ width: `${contextUsagePercent}%` }"></span>
+                </div>
+                <span class="context-meter-inline-value">{{ contextUsagePercent }}%</span>
+                <button v-if="chatContextSummary.text" class="context-meter-inline-toggle" @click="contextSummaryExpanded = !contextSummaryExpanded">
+                  {{ contextSummaryExpanded ? 'Hide' : 'Summary' }}
+                </button>
+              </div>
+            </div>
+            <div v-if="contextSummaryExpanded && chatContextSummary.text" class="context-summary-card">{{ chatContextSummary.text }}</div>
           </div>
         </section>
 
@@ -510,6 +529,32 @@
             <label class="settings-label">TOOLS</label>
             <span class="settings-badge">Approval gated</span>
           </div>
+          <div class="settings-budget-card">
+            <div class="settings-budget-head">
+              <div class="settings-budget-copy-block">
+                <label class="settings-label settings-inline-label">ITERATION BUDGET</label>
+                <div class="settings-budget-value">{{ iterationBudget }} loops per block</div>
+              </div>
+              <span class="settings-badge">{{ iterationBudget }} loops</span>
+            </div>
+            <p class="settings-copy settings-copy-tight settings-budget-copy">Implementation runs use this many loops before Bliss Agent pauses and asks whether it may continue with another block of the same size.</p>
+            <div class="settings-budget-controls">
+              <button class="settings-budget-stepper" type="button" @click="adjustIterationBudget(-1)">−</button>
+              <input
+                v-model="iterationBudget"
+                type="number"
+                min="5"
+                max="60"
+                class="settings-input settings-budget-input"
+                @change="saveIterationBudget"
+              />
+              <button class="settings-budget-stepper" type="button" @click="adjustIterationBudget(1)">+</button>
+            </div>
+            <div class="settings-budget-foot">
+              <span class="settings-budget-meta">Applies to each autonomous implementation block.</span>
+              <span class="settings-budget-range">Min 5 · Max 60</span>
+            </div>
+          </div>
           <p class="settings-copy">This is the current local tool surface available to the agent for the selected working directory. Mutating and risky actions are approval-gated in the chat before execution.</p>
           <div class="settings-tools-grid">
             <div v-for="t in toolsList" :key="t.name" class="settings-tool-item">
@@ -533,7 +578,334 @@ import hljs from 'highlight.js/lib/common'
 const CHAT_SESSIONS_STORAGE_KEY = 'bliss_chat_sessions'
 const ACTIVE_CHAT_STORAGE_KEY = 'bliss_active_chat_id'
 const QUEUED_DRAFTS_STORAGE_KEY = 'bliss_queued_drafts'
+const ITERATION_BUDGET_STORAGE_KEY = 'bliss_iteration_budget'
 const TOOL_RESULT_COLLAPSED_COUNT = 3
+const CHAT_CONTEXT_BUDGET_CHARS = 24000
+const CHAT_CONTEXT_COMPACT_TARGET_RATIO = 0.58
+const CHAT_CONTEXT_KEEP_RECENT_USER_TURNS = 6
+const CHAT_CONTEXT_MIN_USER_TURNS = 3
+const CHAT_CONTEXT_KEEP_MIN_MESSAGES = 8
+const CHAT_CONTEXT_SUMMARY_MAX_CHARS = 2800
+const CHAT_CONTEXT_SUMMARY_MARKER = '[[BLISS_CONTEXT_SUMMARY]]'
+
+function normalizeIterationBudget(value, fallback = 15) {
+  const numericValue = Number(value)
+  if (!Number.isFinite(numericValue)) return fallback
+  return Math.max(5, Math.min(Math.round(numericValue), 60))
+}
+
+function normalizeContextSummary(value) {
+  const normalized = value && typeof value === 'object' ? value : {}
+  return {
+    text: typeof normalized.text === 'string' ? normalized.text.trim() : '',
+    compactedCount: Math.max(0, Number(normalized.compactedCount) || 0),
+    compactedMessages: Math.max(0, Number(normalized.compactedMessages) || 0),
+    lastCompactedAt: Math.max(0, Number(normalized.lastCompactedAt) || 0),
+  }
+}
+
+function getHistoryMessageText(message) {
+  if (typeof message?.content === 'string') return message.content
+  if (Array.isArray(message?.content)) {
+    return message.content.map((entry) => {
+      if (typeof entry === 'string') return entry
+      if (entry && typeof entry === 'object' && typeof entry.text === 'string') return entry.text
+      return ''
+    }).join('\n')
+  }
+  if (message?.content && typeof message.content === 'object') {
+    try {
+      return JSON.stringify(message.content)
+    } catch {
+      return ''
+    }
+  }
+  return ''
+}
+
+function normalizeInlineText(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim()
+}
+
+function truncateInlineText(value, maxLength = 160) {
+  const normalized = normalizeInlineText(value)
+  if (normalized.length <= maxLength) return normalized
+  return `${normalized.slice(0, maxLength - 3).trim()}...`
+}
+
+function truncateMultilineText(value, maxLength = CHAT_CONTEXT_SUMMARY_MAX_CHARS) {
+  const text = String(value || '').trim()
+  if (text.length <= maxLength) return text
+  return `${text.slice(0, maxLength - 3).trim()}...`
+}
+
+function stripMarkdownToPlainText(value) {
+  return normalizeInlineText(String(value || '')
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]*)`/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+    .replace(/[*_>#~-]+/g, ' '))
+}
+
+function isInternalHistoryMessage(value) {
+  const normalized = normalizeInlineText(value)
+  return normalized.startsWith('Automatic recovery required:')
+    || normalized.startsWith('Tool-use correction:')
+    || normalized.startsWith('The previous response was truncated by the model.')
+    || normalized.startsWith('Continue the previous task from the current state until')
+}
+
+function isContextSummaryMessage(message) {
+  return message?.role === 'assistant'
+    && typeof message?.content === 'string'
+    && message.content.startsWith(CHAT_CONTEXT_SUMMARY_MARKER)
+}
+
+function splitStoredContextSummary(history, fallbackSummary = null) {
+  const normalizedSummary = normalizeContextSummary(fallbackSummary)
+  const nextHistory = Array.isArray(history) ? history.slice() : []
+
+  if (nextHistory.length && isContextSummaryMessage(nextHistory[0])) {
+    return {
+      history: nextHistory.slice(1),
+      summary: {
+        ...normalizedSummary,
+        text: nextHistory[0].content.slice(CHAT_CONTEXT_SUMMARY_MARKER.length).trim() || normalizedSummary.text,
+      },
+    }
+  }
+
+  return { history: nextHistory, summary: normalizedSummary }
+}
+
+function buildContextSummaryHistoryMessage(summaryState) {
+  const normalizedSummary = normalizeContextSummary(summaryState)
+  if (!normalizedSummary.text) return null
+
+  return {
+    role: 'assistant',
+    content: `${CHAT_CONTEXT_SUMMARY_MARKER}\n${normalizedSummary.text}`,
+  }
+}
+
+function getHistoryMessageSize(message) {
+  return String(message?.role || '').length + getHistoryMessageText(message).length + 12
+}
+
+function estimateContextUsage(history, summaryState, pendingUserText = '') {
+  const summaryMessage = buildContextSummaryHistoryMessage(summaryState)
+  let total = summaryMessage ? getHistoryMessageSize(summaryMessage) : 0
+
+  for (const message of Array.isArray(history) ? history : []) {
+    total += getHistoryMessageSize(message)
+  }
+
+  if (pendingUserText) {
+    total += String(pendingUserText).length + 16
+  }
+
+  return total
+}
+
+function getContextUsagePercent(history, summaryState, pendingUserText = '') {
+  return Math.max(0, Math.min(100, Math.round((estimateContextUsage(history, summaryState, pendingUserText) / CHAT_CONTEXT_BUDGET_CHARS) * 100)))
+}
+
+function pushUniqueCapped(list, value, maxItems) {
+  if (!value || list.includes(value)) return
+  list.push(value)
+  if (list.length > maxItems) {
+    list.splice(0, list.length - maxItems)
+  }
+}
+
+function extractFileReferencesFromText(value) {
+  const matches = String(value || '').match(/[A-Za-z0-9_./\\-]+\.(?:vue|[cm]?[jt]sx?|cs|py|json|md|css|html)\b/g) || []
+  return matches.map((entry) => entry.replace(/\\/g, '/'))
+}
+
+function summarizeToolHistoryMessage(value) {
+  try {
+    const parsed = JSON.parse(value)
+    if (parsed?.path && typeof parsed.startLine === 'number') {
+      const endLine = typeof parsed.endLine === 'number' ? parsed.endLine : parsed.startLine
+      return truncateInlineText(`Read ${parsed.path}:${parsed.startLine}-${endLine}`, 140)
+    }
+    if (parsed?.path) {
+      return truncateInlineText(`${parsed.success === false ? 'Failed on' : 'Touched'} ${parsed.path}`, 140)
+    }
+    if (parsed?.command) {
+      const exitSuffix = typeof parsed.exitCode === 'number' ? ` (exit ${parsed.exitCode})` : ''
+      return truncateInlineText(`Ran ${parsed.command}${exitSuffix}`, 140)
+    }
+    if (typeof parsed?.message === 'string') {
+      return truncateInlineText(stripMarkdownToPlainText(parsed.message), 140)
+    }
+    if (typeof parsed?.error === 'string') {
+      return truncateInlineText(stripMarkdownToPlainText(parsed.error), 140)
+    }
+  } catch {
+  }
+
+  return truncateInlineText(stripMarkdownToPlainText(value), 140)
+}
+
+function buildCompactedContextText(compactedHistory, previousSummary) {
+  const priorSummary = normalizeContextSummary(previousSummary)
+  const userRequests = []
+  const assistantOutcomes = []
+  const toolNotes = []
+  const fileReferences = []
+
+  for (const message of Array.isArray(compactedHistory) ? compactedHistory : []) {
+    const content = getHistoryMessageText(message)
+    if (!content) continue
+
+    for (const fileRef of extractFileReferencesFromText(content)) {
+      pushUniqueCapped(fileReferences, fileRef, 8)
+    }
+
+    if (message.role === 'user') {
+      if (isInternalHistoryMessage(content)) continue
+      pushUniqueCapped(userRequests, truncateInlineText(stripMarkdownToPlainText(content), 140), 6)
+      continue
+    }
+
+    if (message.role === 'assistant') {
+      if (isContextSummaryMessage(message)) continue
+      pushUniqueCapped(assistantOutcomes, truncateInlineText(stripMarkdownToPlainText(content), 140), 6)
+      continue
+    }
+
+    if (message.role === 'tool') {
+      pushUniqueCapped(toolNotes, summarizeToolHistoryMessage(content), 6)
+    }
+  }
+
+  const sections = ['Earlier chat context was compacted to keep the live prompt small.']
+
+  if (priorSummary.text) {
+    sections.push(`Previously compacted context:\n${priorSummary.text}`)
+  }
+
+  if (userRequests.length) {
+    sections.push(`User requests:\n- ${userRequests.join('\n- ')}`)
+  }
+
+  if (assistantOutcomes.length) {
+    sections.push(`Key outcomes:\n- ${assistantOutcomes.join('\n- ')}`)
+  }
+
+  if (fileReferences.length) {
+    sections.push(`Relevant files:\n- ${fileReferences.join('\n- ')}`)
+  }
+
+  if (toolNotes.length) {
+    sections.push(`Tool and validation notes:\n- ${toolNotes.join('\n- ')}`)
+  }
+
+  sections.push('Use this summary as background memory only. The recent live turns below remain the source of current detail.')
+
+  return truncateMultilineText(sections.join('\n\n'))
+}
+
+function getExternalUserMessageIndices(history) {
+  const indices = []
+  for (let index = 0; index < history.length; index += 1) {
+    const message = history[index]
+    if (message?.role !== 'user') continue
+    if (isInternalHistoryMessage(getHistoryMessageText(message))) continue
+    indices.push(index)
+  }
+  return indices
+}
+
+function findContextCompactionSplitIndex(history, summaryState, pendingUserText = '') {
+  const userIndices = getExternalUserMessageIndices(history)
+  const targetUsage = CHAT_CONTEXT_BUDGET_CHARS * CHAT_CONTEXT_COMPACT_TARGET_RATIO
+
+  if (userIndices.length > CHAT_CONTEXT_KEEP_RECENT_USER_TURNS) {
+    let keepTurns = CHAT_CONTEXT_KEEP_RECENT_USER_TURNS
+    let splitIndex = userIndices[userIndices.length - keepTurns]
+
+    while (splitIndex > 0 && keepTurns > CHAT_CONTEXT_MIN_USER_TURNS) {
+      const liveHistory = history.slice(splitIndex)
+      if (estimateContextUsage(liveHistory, summaryState, pendingUserText) <= targetUsage) {
+        return splitIndex
+      }
+      keepTurns -= 1
+      splitIndex = userIndices[userIndices.length - keepTurns]
+    }
+
+    if (splitIndex > 0) return splitIndex
+  }
+
+  if (history.length > CHAT_CONTEXT_KEEP_MIN_MESSAGES) {
+    return Math.max(1, history.length - CHAT_CONTEXT_KEEP_MIN_MESSAGES)
+  }
+
+  return 0
+}
+
+function trimLiveHistoryAfterCompaction(history, summaryState, pendingUserText = '') {
+  const targetUsage = CHAT_CONTEXT_BUDGET_CHARS * CHAT_CONTEXT_COMPACT_TARGET_RATIO
+  const nextHistory = Array.isArray(history) ? history.slice() : []
+
+  while (nextHistory.length > CHAT_CONTEXT_KEEP_MIN_MESSAGES && estimateContextUsage(nextHistory, summaryState, pendingUserText) > targetUsage) {
+    nextHistory.shift()
+  }
+
+  return nextHistory
+}
+
+function compactChatContext(history, summaryState, pendingUserText = '') {
+  const normalizedState = splitStoredContextSummary(history, summaryState)
+  const currentPercent = getContextUsagePercent(normalizedState.history, normalizedState.summary, pendingUserText)
+
+  if (currentPercent < 100) {
+    return {
+      history: normalizedState.history,
+      summary: normalizedState.summary,
+      compacted: false,
+      percent: currentPercent,
+    }
+  }
+
+  const splitIndex = findContextCompactionSplitIndex(normalizedState.history, normalizedState.summary, pendingUserText)
+  if (splitIndex <= 0) {
+    return {
+      history: normalizedState.history,
+      summary: normalizedState.summary,
+      compacted: false,
+      percent: currentPercent,
+    }
+  }
+
+  const archivedHistory = normalizedState.history.slice(0, splitIndex)
+  let liveHistory = normalizedState.history.slice(splitIndex)
+  const nextSummary = {
+    ...normalizedState.summary,
+    text: buildCompactedContextText(archivedHistory, normalizedState.summary),
+    compactedCount: normalizedState.summary.compactedCount + 1,
+    compactedMessages: normalizedState.summary.compactedMessages + archivedHistory.length,
+    lastCompactedAt: Date.now(),
+  }
+
+  liveHistory = trimLiveHistoryAfterCompaction(liveHistory, nextSummary, pendingUserText)
+
+  return {
+    history: liveHistory,
+    summary: nextSummary,
+    compacted: true,
+    percent: getContextUsagePercent(liveHistory, nextSummary, pendingUserText),
+  }
+}
+
+function buildHistoryForRun(history, summaryState) {
+  const normalizedState = splitStoredContextSummary(history, summaryState)
+  const summaryMessage = buildContextSummaryHistoryMessage(normalizedState.summary)
+  return summaryMessage ? [summaryMessage, ...normalizedState.history] : normalizedState.history
+}
 
 function loadPersistedQueuedDrafts() {
   try {
@@ -588,7 +960,8 @@ function normalizeChatTitle(value) {
 
 function createEmptyChatSession(overrides = {}) {
   const displayMessages = Array.isArray(overrides.displayMessages) ? overrides.displayMessages : []
-  const messages = Array.isArray(overrides.messages) ? overrides.messages : []
+  const normalizedSummaryState = splitStoredContextSummary(overrides.messages, overrides.contextSummary)
+  const messages = normalizedSummaryState.history
   const hasCustomTitle = Boolean(overrides.titleManuallySet)
   const computedTitle = hasCustomTitle
     ? normalizeChatTitle(overrides.title)
@@ -605,6 +978,7 @@ function createEmptyChatSession(overrides = {}) {
     modelEvents: Array.isArray(overrides.modelEvents) ? overrides.modelEvents : [],
     validationRuns: Array.isArray(overrides.validationRuns) ? overrides.validationRuns : [],
     changeEvents: Array.isArray(overrides.changeEvents) ? overrides.changeEvents : [],
+    iterationStateByTurn: overrides.iterationStateByTurn && typeof overrides.iterationStateByTurn === 'object' ? overrides.iterationStateByTurn : {},
     workflowExpandedByTurn: overrides.workflowExpandedByTurn && typeof overrides.workflowExpandedByTurn === 'object' ? overrides.workflowExpandedByTurn : {},
     stoppedTurns: overrides.stoppedTurns && typeof overrides.stoppedTurns === 'object' ? overrides.stoppedTurns : {},
     latestWorkflowTurnId: overrides.latestWorkflowTurnId || null,
@@ -620,6 +994,8 @@ function createEmptyChatSession(overrides = {}) {
     conversationModelLabel: overrides.conversationModelLabel || '',
     conversationModelMeta: overrides.conversationModelMeta || '',
     providerRuntimeState: overrides.providerRuntimeState && typeof overrides.providerRuntimeState === 'object' ? overrides.providerRuntimeState : {},
+    contextSummary: normalizedSummaryState.summary,
+    contextSummaryExpanded: Boolean(overrides.contextSummaryExpanded),
     queuedDrafts: Array.isArray(overrides.queuedDrafts) ? overrides.queuedDrafts.slice(0, 20) : [],
     updatedAt: Number(overrides.updatedAt) || Date.now(),
   }
@@ -669,6 +1045,7 @@ const initialActiveChat = initialChatSessions.find((chat) => chat.id === persist
 const provider = ref(localStorage.getItem('bliss_provider') || 'openrouter')
 const openRouterApiKey = ref(localStorage.getItem('bliss_openrouter_api_key') || localStorage.getItem('bliss_api_key') || '')
 const geminiApiKey = ref(localStorage.getItem('bliss_gemini_api_key') || '')
+const iterationBudget = ref(normalizeIterationBudget(localStorage.getItem(ITERATION_BUDGET_STORAGE_KEY), 15))
 const chatSessions = ref(initialChatSessions)
 const activeChatId = ref(initialActiveChat.id)
 const isApplyingChatState = ref(false)
@@ -682,6 +1059,7 @@ const displayMessages = ref(initialActiveChat.displayMessages || []) // { type, 
 const modelEvents = ref(initialActiveChat.modelEvents || [])
 const validationRuns = ref(initialActiveChat.validationRuns || [])
 const changeEvents = ref(initialActiveChat.changeEvents || [])
+const iterationStateByTurn = ref(initialActiveChat.iterationStateByTurn || {})
 const previewOpen = ref(false)
 const previewWidth = ref(380)
 const previewState = ref({ path: '', content: '', startLine: 0, endLine: 0, focusLine: null, totalLines: 0 })
@@ -701,6 +1079,8 @@ const conversationModelProvider = ref(initialActiveChat.conversationModelProvide
 const conversationModelLabel = ref(initialActiveChat.conversationModelLabel || '')
 const conversationModelMeta = ref(initialActiveChat.conversationModelMeta || '')
 const providerRuntimeState = ref(initialActiveChat.providerRuntimeState || {})
+const chatContextSummary = ref(normalizeContextSummary(initialActiveChat.contextSummary))
+const contextSummaryExpanded = ref(Boolean(initialActiveChat.contextSummaryExpanded))
 const queuedDrafts = ref(initialActiveChat.queuedDrafts || [])
 const messagesEl = ref(null)
 const inputEl = ref(null)
@@ -763,20 +1143,27 @@ const toolsList = [
   { name: 'git_commit', icon: '✓', label: 'Git commit' },
   { name: 'github_auth_status', icon: '⌘', label: 'GitHub status' },
   { name: 'github_repo_info', icon: '⌂', label: 'GitHub repo info' },
+  { name: 'github_issue_list', icon: '⋯', label: 'GitHub issue list' },
   { name: 'github_issue_view', icon: '◌', label: 'GitHub issue view' },
   { name: 'github_issue_create', icon: '⊕', label: 'GitHub issue create' },
   { name: 'github_issue_edit', icon: '≡', label: 'GitHub issue edit' },
   { name: 'github_issue_close', icon: '⊘', label: 'GitHub issue close' },
   { name: 'github_issue_reopen', icon: '↺', label: 'GitHub issue reopen' },
   { name: 'github_issue_comment', icon: '✎', label: 'GitHub issue comment' },
+  { name: 'github_pr_list', icon: '⋮', label: 'GitHub PR list' },
   { name: 'github_pr_view', icon: '◍', label: 'GitHub PR view' },
+  { name: 'github_pr_checks', icon: '☰', label: 'GitHub PR checks' },
   { name: 'github_pr_review_comments', icon: '✦', label: 'PR review comments' },
+  { name: 'github_pr_review_threads', icon: '⟟', label: 'PR review threads' },
   { name: 'github_pr_edit', icon: '≣', label: 'GitHub PR edit' },
   { name: 'github_pr_review_submit', icon: '☑', label: 'GitHub PR review' },
+  { name: 'github_pr_review_thread_reply', icon: '↪', label: 'PR thread reply' },
+  { name: 'github_pr_review_thread_resolve', icon: '⌗', label: 'PR thread resolve' },
   { name: 'github_pr_close', icon: '⊖', label: 'GitHub PR close' },
   { name: 'github_pr_reopen', icon: '↻', label: 'GitHub PR reopen' },
   { name: 'github_pr_comment', icon: '✐', label: 'GitHub PR comment' },
   { name: 'github_pr_merge', icon: '⇉', label: 'GitHub PR merge' },
+  { name: 'github_pr_ready', icon: '◉', label: 'GitHub PR ready/draft' },
   { name: 'github_pr_create', icon: '⇪', label: 'GitHub draft PR' },
   { name: 'run_build', icon: '⚒', label: 'Run build' },
   { name: 'run_test', icon: '🧪', label: 'Run test' },
@@ -918,6 +1305,27 @@ const queuedDraftSummary = computed(() => {
   return `${nextQueuedDraft.value.text} +${queuedDraftCount.value - 1} more`
 })
 
+const contextUsagePercent = computed(() => getContextUsagePercent(messages.value, chatContextSummary.value))
+
+const contextMeterTone = computed(() => {
+  if (contextUsagePercent.value >= 100) return 'full'
+  if (contextUsagePercent.value >= 80) return 'warning'
+  return ''
+})
+
+const contextMeterSummary = computed(() => {
+  if (chatContextSummary.value.text) {
+    const compactedLabel = chatContextSummary.value.compactedCount === 1 ? '1 summary block' : `${chatContextSummary.value.compactedCount} summary blocks`
+    return `Auto-summary active · ${compactedLabel} · keeps the latest ${CHAT_CONTEXT_KEEP_RECENT_USER_TURNS} user turns live.`
+  }
+
+  if (contextUsagePercent.value >= 100) {
+    return 'Older context will be summarized before the next model call.'
+  }
+
+  return 'Older context will be summarized automatically at 100% to keep prompts compact.'
+})
+
 const emptyStateDescription = computed(() => {
   return `AI coding agent powered by ${activeModelLabel}.`
 })
@@ -980,6 +1388,16 @@ function saveActiveApiKey() {
   if (provider.value === 'openrouter') {
     localStorage.removeItem('bliss_api_key')
   }
+}
+
+function saveIterationBudget() {
+  iterationBudget.value = normalizeIterationBudget(iterationBudget.value, 15)
+  localStorage.setItem(ITERATION_BUDGET_STORAGE_KEY, String(iterationBudget.value))
+}
+
+function adjustIterationBudget(delta) {
+  iterationBudget.value = normalizeIterationBudget(Number(iterationBudget.value) + delta, iterationBudget.value)
+  saveIterationBudget()
 }
 
 function selectProvider(nextProvider) {
@@ -1097,6 +1515,7 @@ function buildActiveChatSnapshot() {
     modelEvents: toIpcSafe(modelEvents.value),
     validationRuns: toIpcSafe(validationRuns.value),
     changeEvents: toIpcSafe(changeEvents.value),
+    iterationStateByTurn: toIpcSafe(iterationStateByTurn.value),
     workflowExpandedByTurn: toIpcSafe(workflowExpandedByTurn.value),
     stoppedTurns: toIpcSafe(stoppedTurns.value),
     latestWorkflowTurnId: latestWorkflowTurnId.value,
@@ -1105,6 +1524,8 @@ function buildActiveChatSnapshot() {
     conversationModelLabel: conversationModelLabel.value,
     conversationModelMeta: conversationModelMeta.value,
     providerRuntimeState: toIpcSafe(providerRuntimeState.value),
+    contextSummary: toIpcSafe(chatContextSummary.value),
+    contextSummaryExpanded: contextSummaryExpanded.value,
     queuedDrafts: toIpcSafe(queuedDrafts.value),
     updatedAt: Date.now(),
   })
@@ -1128,6 +1549,7 @@ function applyChatSession(session) {
   modelEvents.value = session.modelEvents || []
   validationRuns.value = session.validationRuns || []
   changeEvents.value = session.changeEvents || []
+  iterationStateByTurn.value = session.iterationStateByTurn || {}
   workflowExpandedByTurn.value = session.workflowExpandedByTurn || {}
   stoppedTurns.value = session.stoppedTurns || {}
   latestWorkflowTurnId.value = session.latestWorkflowTurnId || null
@@ -1139,6 +1561,8 @@ function applyChatSession(session) {
   conversationModelLabel.value = session.conversationModelLabel || ''
   conversationModelMeta.value = session.conversationModelMeta || ''
   providerRuntimeState.value = session.providerRuntimeState || {}
+  chatContextSummary.value = normalizeContextSummary(session.contextSummary)
+  contextSummaryExpanded.value = Boolean(session.contextSummaryExpanded)
   queuedDrafts.value = session.queuedDrafts || []
   clearPreview()
 
@@ -1306,6 +1730,16 @@ function getTurnValidationRuns(turnId) {
   return validationRuns.value.filter((entry) => entry.turnId === turnId)
 }
 
+function getTurnIterationState(turnId) {
+  return iterationStateByTurn.value[turnId] || null
+}
+
+function getWorkflowIterationLabel(turnId) {
+  const state = getTurnIterationState(turnId)
+  if (!state?.max) return ''
+  return `${state.current}/${state.max}`
+}
+
 function getTurnChangeEvents(turnId) {
   return changeEvents.value.filter((entry) => entry.turnId === turnId)
 }
@@ -1353,6 +1787,7 @@ function getTurnWorkflowDiffText(turnId) {
 
 function getTurnWorkflowHasContent(turnId) {
   return Boolean(
+    getTurnIterationState(turnId)?.max ||
     getTurnModelEvents(turnId).length ||
     getTurnWorkflowSteps(turnId).length ||
     getTurnValidationRuns(turnId).length ||
@@ -1365,8 +1800,11 @@ function getTurnWorkflowHasContent(turnId) {
 
 function getWorkflowSummaryLine(turnId) {
   const parts = []
+  const iterationLabel = getWorkflowIterationLabel(turnId)
+  if (iterationLabel) parts.push(`loop ${iterationLabel}`)
   if (isTurnStopped(turnId)) parts.push('stopped')
   if (getTurnModelEvents(turnId).length) parts.push('model updated')
+  if (getTurnModelEvents(turnId).some((entry) => entry.kind === 'finish')) parts.push('finish reason captured')
   if (getTurnWorkflowSteps(turnId).length) parts.push('plan updated')
   if (getTurnValidationRuns(turnId).length) parts.push('validation updated')
   if (getTurnChangeEvents(turnId).length) parts.push('changes updated')
@@ -1376,6 +1814,7 @@ function getWorkflowSummaryLine(turnId) {
 
 function getWorkflowLines(turnId) {
   const entries = []
+  const iterationState = getTurnIterationState(turnId)
   const turnModelEvents = getTurnModelEvents(turnId)
   const workflowSteps = getTurnWorkflowSteps(turnId)
   const validationEntries = getTurnValidationRuns(turnId)
@@ -1393,12 +1832,23 @@ function getWorkflowLines(turnId) {
     })
   }
 
+  if (iterationState?.max) {
+    entries.push({
+      id: `iteration-${turnId}`,
+      label: 'Loop',
+      text: `Iteration ${iterationState.current}/${iterationState.max}${iterationState.intent ? ` · ${iterationState.intent}` : ''}`,
+      tone: 'neutral',
+    })
+  }
+
   turnModelEvents.slice(0, 2).forEach((entry) => {
     entries.push({
       id: `model-${entry.id}`,
       label: 'Model',
-      text: `${entry.providerLabel} · ${entry.model}`,
-      tone: 'neutral',
+      text: entry.kind === 'finish'
+        ? `${entry.finishReason}${entry.toolCallCount ? ` · ${entry.toolCallCount} tool call${entry.toolCallCount === 1 ? '' : 's'}` : ''}${entry.hasContent ? ' · content present' : ''}`
+        : `${entry.providerLabel} · ${entry.model}`,
+      tone: entry.kind === 'finish' ? 'fail' : 'neutral',
     })
   })
 
@@ -1601,6 +2051,30 @@ function recordModelSelection(providerId, model, turnId) {
   modelEvents.value = modelEvents.value.slice(0, 24)
 }
 
+function recordModelResponse(update, turnId) {
+  const finishReason = String(update?.finishReason || '').trim()
+  if (!finishReason || finishReason === 'stop' || finishReason === 'tool_calls') return
+
+  const lastTurnFinishEvent = modelEvents.value[0]
+  if (
+    lastTurnFinishEvent?.turnId === turnId
+    && lastTurnFinishEvent?.kind === 'finish'
+    && lastTurnFinishEvent?.finishReason === finishReason
+  ) {
+    return
+  }
+
+  modelEvents.value.unshift({
+    id: `model-finish-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    turnId,
+    kind: 'finish',
+    finishReason,
+    toolCallCount: Number(update?.toolCallCount) || 0,
+    hasContent: Boolean(update?.hasContent),
+  })
+  modelEvents.value = modelEvents.value.slice(0, 24)
+}
+
 function recordFallbackStatus(update) {
   if (!update?.provider) return
 
@@ -1776,7 +2250,7 @@ function handleComposerSubmit() {
   send()
 }
 
-async function runTurn(userText, mode = 'send') {
+async function runTurn(userText, mode = 'send', options = {}) {
   if (!userText.trim() || !selectedApiKey.value.trim()) return
 
   if (!window.electronAPI?.runAgent) {
@@ -1791,6 +2265,16 @@ async function runTurn(userText, mode = 'send') {
   const turnId = createTurnId()
   const runId = `run-${turnId}`
   const outgoingUserText = buildUserMessageForMode(userText, mode)
+  const showUserMessage = options.displayUserMessage !== false
+  const seedHistory = Array.isArray(options.historyOverride) ? options.historyOverride : messages.value
+  const compactedHistoryState = compactChatContext(seedHistory, chatContextSummary.value, outgoingUserText)
+  const historyForRun = buildHistoryForRun(compactedHistoryState.history, compactedHistoryState.summary)
+  let continuationRequest = null
+
+  if (compactedHistoryState.compacted) {
+    messages.value = compactedHistoryState.history
+    chatContextSummary.value = compactedHistoryState.summary
+  }
 
   stoppedTurns.value = {
     ...stoppedTurns.value,
@@ -1798,7 +2282,9 @@ async function runTurn(userText, mode = 'send') {
   }
   activeRunId.value = runId
   latestWorkflowTurnId.value = turnId
-  displayMessages.value.push({ type: 'user', content: userText, turnId })
+  if (showUserMessage) {
+    displayMessages.value.push({ type: 'user', content: userText, turnId })
+  }
   setThinkingIndicator(turnId, true)
   workflowExpandedByTurn.value = {
     ...workflowExpandedByTurn.value,
@@ -1827,19 +2313,34 @@ async function runTurn(userText, mode = 'send') {
         } else if (update.type === 'model_selected') {
           setThinkingIndicator(turnId, true)
           recordModelSelection(update.provider, update.model, turnId)
+        } else if (update.type === 'model_response') {
+          setThinkingIndicator(turnId, true)
+          recordModelResponse(update, turnId)
+        } else if (update.type === 'iteration') {
+          setThinkingIndicator(turnId, true)
+          iterationStateByTurn.value = {
+            ...iterationStateByTurn.value,
+            [turnId]: {
+              current: Number(update.current) || 0,
+              max: Number(update.max) || 0,
+              intent: update.intent || '',
+            },
+          }
         } else if (update.type === 'assistant_partial') {
           setThinkingIndicator(turnId, false)
           upsertAssistantMessage(turnId, update.content, { isStreaming: true })
         } else if (update.type === 'approval_required') {
           setThinkingIndicator(turnId, false)
+          upsertApprovalMessage(turnId, update)
+        } else if (update.type === 'approval_auto_approved') {
+          setThinkingIndicator(turnId, false)
           const approvalMessage = upsertApprovalMessage(turnId, update)
-          if (shouldAutoApprove(update.tool)) {
-            respondToApproval(approvalMessage, true, {
-              decision: approvalPolicy.value.allowAll ? 'approved-all-chat' : 'approved-all-tool',
-            })
-          }
+          approvalMessage.resolved = true
+          approvalMessage.decision = update.decision || 'approved'
+          approvalMessage.submitting = false
         } else if (update.type === 'tool') {
           setThinkingIndicator(turnId, false)
+          clearStreamingAssistantMessageForTurn(turnId)
           displayMessages.value.push({ type: 'tool', tool: update.tool, args: update.args, result: null, progress: null, turnId, showAllItems: false })
         } else if (update.type === 'tool_progress') {
           setThinkingIndicator(turnId, false)
@@ -1868,11 +2369,14 @@ async function runTurn(userText, mode = 'send') {
 
     const payload = toIpcSafe({
       runId,
+      chatId: activeChatId.value,
       userMessage: outgoingUserText,
-      history: messages.value,
+      history: historyForRun,
       apiKey: selectedApiKey.value,
       provider: provider.value,
       workingDir: workingDir.value,
+      approvalPolicy: approvalPolicy.value,
+      iterationBudget: iterationBudget.value,
     })
 
     const result = await window.electronAPI.runAgent(payload)
@@ -1882,7 +2386,20 @@ async function runTurn(userText, mode = 'send') {
     if (result.success) {
       resolveApprovalMessagesForTurn(turnId, 'approved')
       upsertAssistantMessage(turnId, result.reply, { isStreaming: false })
-      messages.value = result.messages // update history for next turn
+      const nextHistoryState = compactChatContext(result.messages, chatContextSummary.value)
+      messages.value = nextHistoryState.history
+      chatContextSummary.value = nextHistoryState.summary
+    } else if (result.continuationRequired) {
+      resolveApprovalMessagesForTurn(turnId, 'approved')
+      if (Array.isArray(result.messages)) {
+        const nextHistoryState = compactChatContext(result.messages, chatContextSummary.value)
+        messages.value = nextHistoryState.history
+        chatContextSummary.value = nextHistoryState.summary
+      }
+      continuationRequest = {
+        prompt: result.continuationPrompt || 'Continue the previous task from the current state until it is fully complete.',
+        budget: normalizeIterationBudget(result.continuationBudget, iterationBudget.value),
+      }
     } else if (result.cancelled) {
       stoppedTurns.value = {
         ...stoppedTurns.value,
@@ -1892,7 +2409,9 @@ async function runTurn(userText, mode = 'send') {
       if (result.partialReply) {
         upsertAssistantMessage(turnId, result.partialReply, { isStreaming: false })
         if (Array.isArray(result.messages)) {
-          messages.value = result.messages
+          const nextHistoryState = compactChatContext(result.messages, chatContextSummary.value)
+          messages.value = nextHistoryState.history
+          chatContextSummary.value = nextHistoryState.summary
         }
       } else if (!queuedDraftCount.value) {
         displayMessages.value.push({
@@ -1924,6 +2443,27 @@ async function runTurn(userText, mode = 'send') {
     }
     await scrollToBottom()
     nextTick(() => inputEl.value?.focus())
+
+    if (continuationRequest) {
+      const approved = window.confirm(`The iteration budget was reached (${iterationBudget.value} loops). Allow Bliss Agent to continue with another ${continuationRequest.budget}-loop block?`)
+      if (approved) {
+        iterationBudget.value = normalizeIterationBudget(continuationRequest.budget, iterationBudget.value)
+        saveIterationBudget()
+        await runTurn(continuationRequest.prompt, 'steer', {
+          displayUserMessage: false,
+          historyOverride: messages.value,
+        })
+        return
+      }
+
+      displayMessages.value.push({
+        type: 'assistant',
+        content: `Paused after reaching the configured iteration budget (${iterationBudget.value}/${iterationBudget.value}).`,
+        turnId,
+      })
+      await scrollToBottom()
+      return
+    }
 
     if (queuedDraftCount.value) {
       const [nextDraft, ...remainingDrafts] = queuedDrafts.value
@@ -1974,20 +2514,27 @@ function getToolIcon(tool) {
     git_commit: '✓',
     github_auth_status: '⌘',
     github_repo_info: '⌂',
+    github_issue_list: '⋯',
     github_issue_view: '◌',
     github_issue_create: '⊕',
     github_issue_edit: '≡',
     github_issue_close: '⊘',
     github_issue_reopen: '↺',
     github_issue_comment: '✎',
+    github_pr_list: '⋮',
     github_pr_view: '◍',
+    github_pr_checks: '☰',
     github_pr_review_comments: '✦',
+    github_pr_review_threads: '⟟',
     github_pr_edit: '≣',
     github_pr_review_submit: '☑',
+    github_pr_review_thread_reply: '↪',
+    github_pr_review_thread_resolve: '⌗',
     github_pr_close: '⊖',
     github_pr_reopen: '↻',
     github_pr_comment: '✐',
     github_pr_merge: '⇉',
+    github_pr_ready: '◉',
     github_pr_create: '⇪',
     run_build: '⚒',
     run_test: '🧪',
@@ -2041,15 +2588,37 @@ function toolResultItems(msg) {
   if (Array.isArray(result.entries) && msg.tool === 'list_directory') {
     const basePath = msg.args?.path || '.'
     return result.entries
-      .filter((entry) => entry.type === 'file')
       .slice(0, 50)
-      .map((entry) => ({ path: `${basePath === '.' ? '' : `${basePath}/`}${entry.name}`.replace(/\\/g, '/') }))
+      .map((entry) => ({
+        path: `${basePath === '.' ? '' : `${basePath}/`}${entry.name}`.replace(/\\/g, '/'),
+        displayPath: entry.name,
+        previewable: entry.type === 'file',
+        line: entry.type === 'dir' ? 'diretorio' : 'ficheiro',
+      }))
   }
   return []
 }
 
+function getToolResultItemIcon(item) {
+  if (item?.previewable === false) return '📁'
+  return '📄'
+}
+
+function getToolResultItemLabel(item) {
+  return item?.displayPath || item?.path || ''
+}
+
+function handleToolResultItemClick(item) {
+  if (!item || item.previewable === false) return
+  openPreview(item)
+}
+
 function isToolResultExpanded(msg) {
   return Boolean(msg?.showAllItems)
+}
+
+function shouldShowAllToolResultItems(msg) {
+  return msg?.tool === 'list_directory'
 }
 
 function canExpandToolResult(msg) {
@@ -2058,6 +2627,7 @@ function canExpandToolResult(msg) {
 
 function visibleToolResultItems(msg) {
   const items = toolResultItems(msg)
+  if (shouldShowAllToolResultItems(msg)) return items
   if (isToolResultExpanded(msg)) return items
   return items.slice(0, TOOL_RESULT_COLLAPSED_COUNT)
 }
@@ -2065,6 +2635,7 @@ function visibleToolResultItems(msg) {
 function getToolResultCountLabel(msg) {
   const count = toolResultItems(msg).length
   if (!count) return ''
+  if (shouldShowAllToolResultItems(msg)) return `${count} item${count === 1 ? '' : 's'}`
   if (!canExpandToolResult(msg)) return `${count} item${count === 1 ? '' : 's'}`
   return isToolResultExpanded(msg)
     ? `${count} items`
@@ -2138,6 +2709,13 @@ function findLastAssistantMessageForTurn(turnId) {
     .find((message) => message.type === 'assistant' && message.turnId === turnId)
 }
 
+function clearStreamingAssistantMessageForTurn(turnId) {
+  const index = displayMessages.value.findIndex((message) => message.type === 'assistant' && message.turnId === turnId && message.isStreaming)
+  if (index === -1) return
+
+  displayMessages.value.splice(index, 1)
+}
+
 function findApprovalMessage(requestId) {
   return displayMessages.value.find((message) => message.type === 'approval' && message.requestId === requestId)
 }
@@ -2166,11 +2744,6 @@ function setThinkingIndicator(turnId, visible, text = 'Thinking...') {
   }
 
   displayMessages.value.push({ type: 'thinking', turnId, text })
-}
-
-function shouldAutoApprove(toolName) {
-  if (!toolName) return approvalPolicy.value.allowAll
-  return approvalPolicy.value.allowAll || Boolean(approvalPolicy.value.allowedTools[toolName])
 }
 
 function rememberApprovalScope(toolName, scope) {
@@ -2258,6 +2831,8 @@ async function respondToApproval(message, approved, options = {}) {
       runId: message.runId || activeRunId.value,
       requestId: message.requestId,
       approved,
+      scope: approved ? (options.scope || '') : '',
+      chatId: activeChatId.value,
     })
 
     if (!result?.success) {
@@ -2285,6 +2860,18 @@ async function respondToApproval(message, approved, options = {}) {
   await scrollToBottom()
 }
 
+async function syncApprovalPolicyToBackend(chatId = activeChatId.value, policy = approvalPolicy.value) {
+  if (!chatId || !window.electronAPI?.setApprovalPolicy) return
+
+  try {
+    await window.electronAPI.setApprovalPolicy({
+      chatId,
+      approvalPolicy: toIpcSafe(policy || { allowAll: false, allowedTools: {} }),
+    })
+  } catch {
+  }
+}
+
 function upsertAssistantMessage(turnId, content, { isStreaming = false } = {}) {
   const existingMessage = findLastAssistantMessageForTurn(turnId)
   if (existingMessage) {
@@ -2296,10 +2883,178 @@ function upsertAssistantMessage(turnId, content, { isStreaming = false } = {}) {
   displayMessages.value.push({ type: 'assistant', content, turnId, isStreaming })
 }
 
-function renderMarkdown(text) {
-  const normalized = escapeHtml(normalizeDisplayText(text))
+function stripMarkdownDecorators(value) {
+  return String(value || '')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/__([^_]+)__/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/[*_]+/g, '')
+    .trim()
+}
+
+function extractPreviewBasePathFromText(text) {
+  const normalized = stripMarkdownDecorators(normalizeDisplayText(text))
   if (!normalized) return ''
-  return normalized
+
+  const folderMatch = normalized.match(/(?:dentro da pasta|inside (?:the )?folder|in folder|conte[uú]do da pasta)\s+([A-Za-z0-9_.\-/\\]+)(?=\s*[,:]|\s|$)/i)
+  if (folderMatch?.[1]) {
+    return folderMatch[1]
+      .trim()
+      .replace(/^["'`]+|["'`]+$/g, '')
+      .replace(/\\/g, '/')
+      .replace(/^\.\//, '')
+      .replace(/\/$/, '')
+  }
+
+  return ''
+}
+
+function isPreviewableFilePath(value) {
+  const normalized = String(value || '').trim()
+  if (!normalized) return false
+  if (/[\\/]$/.test(normalized)) return false
+  return /(?:^|[\\/])[^\\/]+\.[A-Za-z0-9_-]+$/.test(normalized)
+}
+
+function buildPreviewPath(rawPath, sourceText) {
+  const normalizedPath = stripMarkdownDecorators(rawPath)
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+  if (!isPreviewableFilePath(normalizedPath)) return ''
+  if (normalizedPath.includes('/')) return normalizedPath
+
+  const basePath = extractPreviewBasePathFromText(sourceText)
+  return basePath ? `${basePath}/${normalizedPath}` : normalizedPath
+}
+
+function renderPreviewableCellContent(cellText, sourceText) {
+  const previewPath = buildPreviewPath(cellText, sourceText)
+  if (!previewPath) return cellText || '&nbsp;'
+
+  return `<button class="assistant-preview-link" type="button" data-preview-path="${encodeURIComponent(previewPath)}" data-preview-label="${encodeURIComponent(cellText)}">${cellText}</button>`
+}
+
+function renderPreviewableTextSegment(segment, sourceText) {
+  return String(segment || '').replace(/(^|[\s([{"'])((?:[A-Za-z0-9_.-]+[\\/])*[A-Za-z0-9_.-]+\.[A-Za-z0-9_-]+)(?=$|[\s)\]}",:;!?'])/g, (match, prefix, candidate) => {
+    const previewPath = buildPreviewPath(candidate, sourceText)
+    if (!previewPath) return match
+    return `${prefix}<button class="assistant-preview-link" type="button" data-preview-path="${encodeURIComponent(previewPath)}" data-preview-label="${encodeURIComponent(candidate)}">${candidate}</button>`
+  })
+}
+
+function renderPreviewableTextPaths(html, sourceText) {
+  const parts = String(html || '').split(/(<[^>]+>)/g)
+  let inPre = 0
+  let inCode = 0
+  let inButton = 0
+
+  return parts.map((part) => {
+    if (!part) return part
+
+    if (part.startsWith('<')) {
+      if (/^<pre\b/i.test(part)) inPre += 1
+      else if (/^<code\b/i.test(part)) inCode += 1
+      else if (/^<button\b/i.test(part)) inButton += 1
+      else if (/^<\/pre>/i.test(part)) inPre = Math.max(0, inPre - 1)
+      else if (/^<\/code>/i.test(part)) inCode = Math.max(0, inCode - 1)
+      else if (/^<\/button>/i.test(part)) inButton = Math.max(0, inButton - 1)
+      return part
+    }
+
+    if (inPre || inCode || inButton) return part
+    return renderPreviewableTextSegment(part, sourceText)
+  }).join('')
+}
+
+function resolvePreviewPathFromTurn(message, previewLabel) {
+  const normalizedLabel = stripMarkdownDecorators(previewLabel)
+    .trim()
+    .replace(/^["'`]+|["'`]+$/g, '')
+    .replace(/\\/g, '/')
+
+  if (!normalizedLabel) return ''
+
+  const relevantToolMessages = [...displayMessages.value]
+    .reverse()
+    .filter((entry) => entry?.type === 'tool' && entry.turnId === message?.turnId && entry.tool === 'list_directory' && entry.result?.success)
+
+  for (const toolMessage of relevantToolMessages) {
+    const matchedItem = toolResultItems(toolMessage).find((item) => item.path === normalizedLabel || item.path.endsWith(`/${normalizedLabel}`))
+    if (matchedItem?.path) {
+      return matchedItem.path
+    }
+  }
+
+  return ''
+}
+
+async function handleAssistantContentClick(event, message) {
+  const trigger = event?.target?.closest?.('.assistant-preview-link')
+  if (!trigger) return
+
+  const previewLabel = decodeURIComponent(trigger.getAttribute('data-preview-label') || '')
+  const previewPath = resolvePreviewPathFromTurn(message, previewLabel)
+    || decodeURIComponent(trigger.getAttribute('data-preview-path') || '')
+  if (!previewPath) return
+
+  await openPreview({
+    path: previewPath,
+    lineNumber: null,
+    line: previewLabel,
+  })
+}
+
+function renderMarkdownTableSegment(segment, sourceText) {
+  const lines = segment.split('\n').filter((line) => line.trim())
+  if (lines.length < 2) return segment
+
+  const headerLine = lines[0]
+  const separatorLine = lines[1]
+  const bodyLines = lines.slice(2)
+
+  if (!/^\|?(\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?$/.test(separatorLine.trim())) {
+    return segment
+  }
+
+  const parseCells = (line) => line
+    .trim()
+    .replace(/^\|/, '')
+    .replace(/\|$/, '')
+    .split('|')
+    .map((cell) => cell.trim())
+
+  const headerCells = parseCells(headerLine)
+  if (!headerCells.length) return segment
+
+  const headerHtml = headerCells
+    .map((cell) => `<th>${cell || '&nbsp;'}</th>`)
+    .join('')
+
+  const bodyHtml = bodyLines
+    .map((line) => parseCells(line))
+    .filter((cells) => cells.length > 0)
+    .map((cells) => `<tr>${cells.map((cell) => `<td>${renderPreviewableCellContent(cell, sourceText)}</td>`).join('')}</tr>`)
+    .join('')
+
+  return `<table class="chat-markdown-table"><thead><tr>${headerHtml}</tr></thead><tbody>${bodyHtml}</tbody></table>`
+}
+
+function renderMarkdownTables(text, sourceText) {
+  return String(text || '').replace(/(^|<br>)(\|[^<\n]+\|(?:<br>\|[^<\n]+\|)+)/g, (match, prefix, block) => {
+    const normalizedBlock = block.replace(/<br>/g, '\n')
+    const renderedTable = renderMarkdownTableSegment(normalizedBlock, sourceText)
+    if (renderedTable === normalizedBlock) return match
+    return `${prefix}${renderedTable}`
+  })
+}
+
+function renderMarkdown(text) {
+  const displayText = normalizeDisplayText(text)
+  const normalized = escapeHtml(displayText)
+  if (!normalized) return ''
+  return renderPreviewableTextPaths(renderMarkdownTables(normalized
     // code blocks
     .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="lang-$1">$2</code></pre>')
     // inline code
@@ -2307,7 +3062,7 @@ function renderMarkdown(text) {
     // bold
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     // newlines
-    .replace(/\n/g, '<br>')
+    .replace(/\n/g, '<br>'), displayText), displayText)
 }
 
 onMounted(() => {
@@ -2335,6 +3090,8 @@ watch([
   conversationModelLabel,
   conversationModelMeta,
   providerRuntimeState,
+  chatContextSummary,
+  contextSummaryExpanded,
   queuedDrafts,
 ], () => {
   syncActiveChatSession()
@@ -2353,6 +3110,10 @@ watch(chatSessions, () => {
 watch(activeChatId, () => {
   saveChatSessions()
 })
+
+watch([approvalPolicy, activeChatId], ([nextApprovalPolicy, nextChatId]) => {
+  syncApprovalPolicyToBackend(nextChatId, nextApprovalPolicy)
+}, { deep: true, immediate: true })
 
 onBeforeUnmount(() => {
   syncActiveChatSession()
@@ -3280,6 +4041,103 @@ onBeforeUnmount(() => {
   margin-bottom: 14px;
 }
 
+.settings-budget-card {
+  margin-bottom: 14px;
+  padding: 12px;
+  border-radius: 14px;
+  border: 1px solid rgba(255,255,255,0.06);
+  background: rgba(255,255,255,0.025);
+}
+
+.settings-budget-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-budget-copy-block {
+  min-width: 0;
+}
+
+.settings-inline-label {
+  margin-bottom: 6px;
+}
+
+.settings-budget-value {
+  color: var(--text);
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.settings-budget-copy {
+  max-width: 40ch;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.settings-budget-controls {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 88px) 38px;
+  gap: 8px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.settings-budget-stepper {
+  height: 38px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.03);
+  color: var(--text-2);
+  font-size: 16px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.settings-budget-stepper:hover {
+  border-color: var(--border-bright);
+  background: rgba(255,255,255,0.07);
+}
+
+.settings-budget-input {
+  height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: rgba(255,255,255,0.03);
+  color: var(--text);
+  text-align: center;
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1;
+  padding: 0 10px;
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+.settings-budget-input::-webkit-outer-spin-button,
+.settings-budget-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+.settings-budget-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+
+.settings-budget-meta,
+.settings-budget-range {
+  color: var(--text-3);
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+
 .settings-facts {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3430,6 +4288,7 @@ onBeforeUnmount(() => {
 }
 
 .workflow-inline-summary,
+.workflow-inline-iteration,
 .workflow-inline-state,
 .workflow-inline-chevron {
   color: var(--text-3);
@@ -3792,6 +4651,56 @@ onBeforeUnmount(() => {
 
 .msg-text :deep(strong) { color: var(--text); font-weight: 600; }
 
+.msg-text :deep(table) {
+  width: auto;
+  max-width: 100%;
+  display: inline-table;
+  table-layout: auto;
+  border-collapse: collapse;
+  margin: 10px 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.msg-text :deep(th),
+.msg-text :deep(td) {
+  padding: 8px 10px;
+  text-align: left;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.msg-text :deep(th) {
+  background: var(--bg-3);
+  color: var(--text);
+  font-weight: 600;
+}
+
+.msg-text :deep(td) {
+  color: var(--text-2);
+}
+
+.msg-text :deep(tr:last-child td) {
+  border-bottom: 0;
+}
+
+.msg-text :deep(.assistant-preview-link) {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent-2);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.msg-text :deep(.assistant-preview-link:hover) {
+  color: var(--text);
+  text-decoration: underline;
+}
+
 /* Tool calls */
 .tool-call {
   background: var(--bg-2);
@@ -3866,11 +4775,12 @@ onBeforeUnmount(() => {
 .tool-call-result.error { color: var(--red); }
 
 .approval-card {
-  min-width: 320px;
+  min-width: 0;
+  max-width: min(100%, 640px);
   display: grid;
-  gap: 10px;
-  padding: 12px 14px;
-  border-radius: 14px;
+  gap: 5px;
+  padding: 8px 10px;
+  border-radius: 10px;
   border: 1px solid rgba(255,255,255,0.08);
   background: rgba(18,20,31,0.92);
 }
@@ -3891,18 +4801,19 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 8px;
 }
 
 .approval-title {
   color: var(--text);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 600;
+  line-height: 1.2;
 }
 
 .approval-risk {
   color: #f3c97c;
-  font-size: 11px;
+  font-size: 9px;
   letter-spacing: 0.08em;
 }
 
@@ -3910,17 +4821,27 @@ onBeforeUnmount(() => {
 .approval-args,
 .approval-status {
   color: var(--text-2);
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 10px;
+  line-height: 1.3;
 }
 
 .approval-actions {
   display: flex;
-  gap: 8px;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.approval-card .composer-btn {
+  height: 24px;
+  padding: 0 8px;
+  font-size: 10px;
 }
 
 .tool-result-item {
-  display: block;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   width: 100%;
   text-align: left;
   border: 1px solid var(--border);
@@ -3929,12 +4850,27 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   padding: 8px 10px;
   margin-bottom: 8px;
+  cursor: default;
+}
+
+.tool-result-item.clickable {
   cursor: pointer;
 }
 
-.tool-result-item:hover {
+.tool-result-item.clickable:hover {
   border-color: var(--accent);
   color: var(--text);
+}
+
+.tool-result-item-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tool-result-item-icon {
+  flex-shrink: 0;
 }
 
 .tool-result-item-path,
@@ -3946,19 +4882,18 @@ onBeforeUnmount(() => {
 .tool-result-item-path {
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 4px;
-  word-break: break-all;
+  word-break: break-word;
 }
 
 .tool-result-item-line {
   color: var(--accent);
-  margin-bottom: 4px;
+  flex-shrink: 0;
 }
 
 .tool-result-item-text {
   color: var(--text-3);
-  white-space: normal;
-  word-break: break-word;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* Thinking */
@@ -4000,6 +4935,90 @@ onBeforeUnmount(() => {
   padding: 16px 24px 20px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+}
+
+.input-hint-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 8px;
+  min-width: 0;
+}
+
+.context-meter-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 0 0 8px;
+  color: var(--text-3);
+  font-size: 10px;
+  font-family: var(--font-mono);
+  flex-shrink: 0;
+}
+
+.context-meter-inline.warning {
+  color: #f3c97c;
+}
+
+.context-meter-inline.full {
+  color: #ff9eb0;
+}
+
+.context-meter-inline-label,
+.context-meter-inline-value {
+  white-space: nowrap;
+}
+
+.context-meter-inline-bar {
+  width: 72px;
+  height: 4px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255,255,255,0.06);
+}
+
+.context-meter-inline-fill {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 0.2s ease;
+}
+
+.context-meter-inline.warning .context-meter-inline-fill {
+  background: linear-gradient(90deg, #f3c97c, #f0a96e);
+}
+
+.context-meter-inline.full .context-meter-inline-fill {
+  background: linear-gradient(90deg, #ff8f8f, #f55c7a);
+}
+
+.context-meter-inline-toggle {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  cursor: pointer;
+}
+
+.context-meter-inline-toggle:hover {
+  color: var(--text);
+}
+
+.context-summary-card {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-2);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .input-wrapper {
@@ -4094,8 +5113,8 @@ onBeforeUnmount(() => {
   font-size: 10px;
   color: var(--text-3);
   font-family: var(--font-mono);
-  margin-top: 8px;
   padding-left: 2px;
+  min-width: 0;
 }
 
 .queued-draft {
