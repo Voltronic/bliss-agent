@@ -96,7 +96,7 @@
 
       <div class="sidebar-footer">
         <button class="new-chat-btn" :disabled="isRunning" @click="newChat">
-          <span>+</span> New chat
+          + New chat
         </button>
       </div>
     </aside>
@@ -112,6 +112,15 @@
           <button v-if="apiKeyMissing" class="topbar-alert" @click="openSettings('provider')">
             <span class="topbar-alert-dot"></span>
             <span>{{ activeProvider.inputLabel }} missing</span>
+          </button>
+          <button
+            v-if="hasRunSnapshot"
+            class="topbar-undo-btn"
+            :disabled="isRunning || undoingRunSnapshot"
+            :title="runSnapshotSummary"
+            @click="undoLastRunSnapshot()"
+          >
+            {{ undoingRunSnapshot ? 'Undoing...' : `Undo last run${runSnapshotStatus.changedFiles ? ` (${runSnapshotStatus.changedFiles})` : ''}` }}
           </button>
           <div class="provider-pill">
             <span class="provider-pill-label">{{ activeProvider.label }}</span>
@@ -136,6 +145,21 @@
         <button class="approval-policy-clear" @click="clearApprovalPolicy()">
           Turn off
         </button>
+      </div>
+
+      <div v-if="hasPendingChangeBatch" class="change-batch-banner">
+        <div class="change-batch-copy">
+          <span class="change-batch-label">PENDING CODE CHANGES</span>
+          <span class="change-batch-text">{{ pendingChangeBatchSummary }}</span>
+        </div>
+        <div class="change-batch-actions">
+          <button class="change-batch-approve" :disabled="isRunning || Boolean(changeBatchAction)" @click="approvePendingChangeBatch()">
+            {{ changeBatchAction === 'approve' ? 'Approving...' : `Approve (${pendingChangeBatch.fileCount})` }}
+          </button>
+          <button class="change-batch-cancel" :disabled="isRunning || Boolean(changeBatchAction)" @click="cancelPendingChangeBatch()">
+            {{ changeBatchAction === 'cancel' ? 'Reverting...' : `Cancel (${pendingChangeBatch.fileCount})` }}
+          </button>
+        </div>
       </div>
 
       <div class="workspace">
@@ -179,14 +203,29 @@
                 <template v-else-if="msg.type === 'approval'">
                   <div class="msg-avatar agent-avatar">!</div>
                   <div class="msg-body">
-                    <div class="approval-card" :class="[`risk-${msg.riskLevel || 'medium'}`, { resolved: msg.resolved }]">
+                    <div
+                      class="approval-card"
+                      :class="[
+                        `risk-${msg.riskLevel || 'medium'}`,
+                        {
+                          resolved: msg.resolved,
+                          expanded: isApprovalExpanded(msg),
+                          clickable: msg.resolved,
+                        },
+                      ]"
+                      @click="toggleApprovalMessage(msg)"
+                    >
                       <div class="approval-head">
                         <span class="approval-title">{{ msg.title || 'Approval required' }}</span>
-                        <span class="approval-risk">{{ (msg.riskLevel || 'medium').toUpperCase() }}</span>
+                        <span class="approval-head-meta">
+                          <span class="approval-risk">{{ (msg.riskLevel || 'medium').toUpperCase() }}</span>
+                          <span v-if="msg.resolved" class="approval-chevron">{{ isApprovalExpanded(msg) ? '−' : '+' }}</span>
+                        </span>
                       </div>
-                      <div class="approval-summary">{{ msg.summary }}</div>
-                      <div v-if="formatToolArgs(msg.args)" class="approval-args">{{ formatToolArgs(msg.args) }}</div>
-                      <div v-if="!msg.resolved" class="approval-actions">
+                      <template v-if="isApprovalExpanded(msg)">
+                        <div class="approval-summary">{{ msg.summary }}</div>
+                        <div v-if="formatToolArgs(msg.args)" class="approval-args">{{ formatToolArgs(msg.args) }}</div>
+                        <div v-if="!msg.resolved" class="approval-actions">
                         <button class="composer-btn composer-btn-primary" :disabled="msg.submitting" @click="respondToApproval(msg, true)">
                           {{ msg.submitting ? 'Sending...' : 'Approve' }}
                         </button>
@@ -199,10 +238,11 @@
                         <button class="composer-btn composer-btn-secondary" :disabled="msg.submitting" @click="respondToApproval(msg, false)">
                           Deny
                         </button>
-                      </div>
-                      <div v-else class="approval-status">
-                        {{ getApprovalStatusLabel(msg.decision) }}
-                      </div>
+                        </div>
+                        <div v-else class="approval-status">
+                          {{ getApprovalStatusLabel(msg.decision) }}
+                        </div>
+                      </template>
                     </div>
                   </div>
                 </template>
@@ -213,14 +253,36 @@
                       <span class="tool-call-icon">{{ getToolIcon(msg.tool) }}</span>
                       <span class="tool-call-name">{{ msg.tool }}</span>
                       <span class="tool-call-args">{{ formatToolArgs(msg.args) }}</span>
-                      <div v-if="toolResultItems(msg).length" class="tool-call-meta">
+                      <div v-if="getToolResultDisplayCount(msg)" class="tool-call-meta">
                         <span class="tool-call-count">{{ getToolResultCountLabel(msg) }}</span>
                         <span v-if="canExpandToolResult(msg)" class="tool-call-chevron">{{ isToolResultExpanded(msg) ? '−' : '+' }}</span>
                       </div>
                     </div>
                     <div v-if="!msg.result && msg.progress?.message" class="tool-call-progress">{{ msg.progress.message }}</div>
                     <div v-if="msg.result" class="tool-call-result" :class="{ error: !msg.result.success, expanded: isToolResultExpanded(msg) }">
-                      <template v-if="visibleToolResultItems(msg).length">
+                      <template v-if="getChangedFilesFromResult(msg.result).length">
+                        <div v-if="msg.result.message" class="tool-change-summary">{{ msg.result.message }}</div>
+                        <div class="tool-change-list">
+                          <div
+                            v-for="change in getChangedFilesFromResult(msg.result)"
+                            :key="`${msg.tool}-${change.path}`"
+                            class="tool-change-item"
+                          >
+                            <button class="tool-change-main" @click="openChangedFilePreview(change, 'file')">
+                              <span class="tool-change-name">{{ change.path }}</span>
+                              <span class="tool-change-stats">
+                                <span class="tool-change-stat added">+{{ change.addedLines }}</span>
+                                <span class="tool-change-stat removed">-{{ change.removedLines }}</span>
+                              </span>
+                            </button>
+                            <div class="tool-change-actions">
+                              <button class="tool-change-action" @click.stop="openChangedFilePreview(change, 'file')">File</button>
+                              <button v-if="change.diff" class="tool-change-action" @click.stop="openChangedFilePreview(change, 'diff')">Diff</button>
+                            </div>
+                          </div>
+                        </div>
+                      </template>
+                      <template v-else-if="visibleToolResultItems(msg).length">
                         <component
                           v-for="item in visibleToolResultItems(msg)"
                           :key="`${msg.tool}-${item.path}-${item.lineNumber || 0}`"
@@ -310,6 +372,20 @@
                     <button class="queued-draft-remove" @click="removeQueuedDraft(draft.id)">Remove</button>
                   </div>
                 </div>
+              </div>
+            </div>
+            <div v-if="showStalledRunRecovery" class="run-stalled-banner">
+              <div class="run-stalled-copy">
+                <span class="run-stalled-label">RUN STALLED</span>
+                <span class="run-stalled-text">This run has stopped producing updates. You can still request stop, or release the UI if cancellation is taking too long.</span>
+              </div>
+              <div class="run-stalled-actions">
+                <button class="run-stalled-btn" :disabled="isCancelling" @click="stopRun()">
+                  {{ isCancelling ? 'Stopping...' : 'Request stop' }}
+                </button>
+                <button class="run-stalled-btn danger" @click="forceReleaseStalledRun()">
+                  Release UI
+                </button>
               </div>
             </div>
             <div class="input-wrapper" :class="{ disabled: composerDisabled }">
@@ -402,10 +478,14 @@
         >
           <div class="preview-header">
             <div>
-              <div class="preview-title">File Viewer</div>
+              <div class="preview-title">{{ previewMode === 'diff' ? 'Diff Viewer' : 'File Viewer' }}</div>
               <div class="preview-subtitle">{{ previewState.path || 'Select a file result to preview content' }}</div>
             </div>
             <div v-if="previewState.path" class="preview-actions">
+              <div class="preview-mode-toggle">
+                <button class="preview-mode-btn" :class="{ active: previewMode === 'file' }" @click="setPreviewMode('file')">File</button>
+                <button v-if="previewHasDiff" class="preview-mode-btn" :class="{ active: previewMode === 'diff' }" @click="setPreviewMode('diff')">Diff</button>
+              </div>
               <span v-if="previewLanguage" class="preview-language">{{ previewLanguage }}</span>
               <button class="preview-copy" @click="copyPreviewContent">{{ previewCopyState || 'Copy' }}</button>
               <button class="preview-close" @click="clearPreview">×</button>
@@ -416,11 +496,28 @@
           <div v-else-if="previewError" class="preview-status error">{{ previewError }}</div>
           <div v-else-if="previewState.path" class="preview-body">
             <div class="preview-meta">
-              <span>Lines {{ previewState.startLine }}-{{ previewState.endLine }}</span>
-              <span v-if="previewState.focusLine">Focus L{{ previewState.focusLine }}</span>
-              <span>Total {{ previewState.totalLines }}</span>
+              <template v-if="previewMode === 'diff' && previewHasDiff">
+                <span>Current-run diff</span>
+                <span class="preview-stat added">+{{ previewState.addedLines }}</span>
+                <span class="preview-stat removed">-{{ previewState.removedLines }}</span>
+              </template>
+              <template v-else>
+                <span>Lines {{ previewState.startLine }}-{{ previewState.endLine }}</span>
+                <span v-if="previewState.focusLine">Focus L{{ previewState.focusLine }}</span>
+                <span>Total {{ previewState.totalLines }}</span>
+              </template>
             </div>
-            <pre class="preview-code hljs"><code v-html="highlightedPreviewContent"></code></pre>
+            <div v-if="previewMode === 'diff' && previewHasDiff" class="preview-diff">
+              <div
+                v-for="line in previewDiffLines"
+                :key="line.id"
+                class="preview-diff-line"
+                :class="line.kind"
+              >
+                <span class="preview-diff-text">{{ line.text }}</span>
+              </div>
+            </div>
+            <pre v-else class="preview-code hljs"><code v-html="highlightedPreviewContent"></code></pre>
           </div>
           <div v-else class="preview-status">Search results and file matches become clickable here.</div>
         </aside>
@@ -982,6 +1079,7 @@ function createEmptyChatSession(overrides = {}) {
     workflowExpandedByTurn: overrides.workflowExpandedByTurn && typeof overrides.workflowExpandedByTurn === 'object' ? overrides.workflowExpandedByTurn : {},
     stoppedTurns: overrides.stoppedTurns && typeof overrides.stoppedTurns === 'object' ? overrides.stoppedTurns : {},
     latestWorkflowTurnId: overrides.latestWorkflowTurnId || null,
+    chatTaskMode: typeof overrides.chatTaskMode === 'string' ? overrides.chatTaskMode : '',
     approvalPolicy: overrides.approvalPolicy && typeof overrides.approvalPolicy === 'object'
       ? {
           allowAll: Boolean(overrides.approvalPolicy.allowAll),
@@ -990,6 +1088,7 @@ function createEmptyChatSession(overrides = {}) {
             : {},
         }
       : { allowAll: false, allowedTools: {} },
+    pendingChangeBatch: normalizeChangeBatchState(overrides.pendingChangeBatch),
     conversationModelProvider: overrides.conversationModelProvider || '',
     conversationModelLabel: overrides.conversationModelLabel || '',
     conversationModelMeta: overrides.conversationModelMeta || '',
@@ -1062,7 +1161,7 @@ const changeEvents = ref(initialActiveChat.changeEvents || [])
 const iterationStateByTurn = ref(initialActiveChat.iterationStateByTurn || {})
 const previewOpen = ref(false)
 const previewWidth = ref(380)
-const previewState = ref({ path: '', content: '', startLine: 0, endLine: 0, focusLine: null, totalLines: 0 })
+const previewState = ref(createEmptyPreviewState())
 const previewLoading = ref(false)
 const previewError = ref('')
 const previewCopyState = ref('')
@@ -1071,10 +1170,17 @@ const settingsTab = ref('provider')
 const workflowExpandedByTurn = ref(initialActiveChat.workflowExpandedByTurn || {})
 const stoppedTurns = ref(initialActiveChat.stoppedTurns || {})
 const latestWorkflowTurnId = ref(initialActiveChat.latestWorkflowTurnId || null)
+const chatTaskMode = ref(initialActiveChat.chatTaskMode || '')
 const activeRunId = ref('')
 const isCancelling = ref(false)
 const activeToolState = ref({ tool: '', cancelling: false })
 const approvalPolicy = ref(initialActiveChat.approvalPolicy || { allowAll: false, allowedTools: {} })
+const pendingChangeBatch = ref(normalizeChangeBatchState(initialActiveChat.pendingChangeBatch))
+const runSnapshotStatus = ref(createEmptyRunSnapshotState())
+const undoingRunSnapshot = ref(false)
+const stalledRunState = ref({ active: false, runId: '', turnId: '', since: 0 })
+const activeRunSession = ref(null)
+const changeBatchAction = ref('')
 const conversationModelProvider = ref(initialActiveChat.conversationModelProvider || '')
 const conversationModelLabel = ref(initialActiveChat.conversationModelLabel || '')
 const conversationModelMeta = ref(initialActiveChat.conversationModelMeta || '')
@@ -1082,6 +1188,8 @@ const providerRuntimeState = ref(initialActiveChat.providerRuntimeState || {})
 const chatContextSummary = ref(normalizeContextSummary(initialActiveChat.contextSummary))
 const contextSummaryExpanded = ref(Boolean(initialActiveChat.contextSummaryExpanded))
 const queuedDrafts = ref(initialActiveChat.queuedDrafts || [])
+const RUN_STALL_TIMEOUT_MS = 45000
+let runStallTimer = null
 const messagesEl = ref(null)
 const inputEl = ref(null)
 const chatRenameInputEl = ref(null)
@@ -1259,6 +1367,10 @@ const hasActiveApprovalPolicy = computed(() => {
   return approvalPolicy.value.allowAll || activeApprovalToolLabels.value.length > 0
 })
 
+const hasPendingChangeBatch = computed(() => {
+  return pendingChangeBatch.value.pending && pendingChangeBatch.value.fileCount > 0
+})
+
 const activeApprovalPolicySummary = computed(() => {
   if (approvalPolicy.value.allowAll) {
     return 'All approval-gated commands will auto-run in this chat.'
@@ -1269,6 +1381,36 @@ const activeApprovalPolicySummary = computed(() => {
   }
 
   return `${activeApprovalToolLabels.value.join(', ')} will auto-run in this chat.`
+})
+
+const pendingChangeBatchSummary = computed(() => {
+  if (!hasPendingChangeBatch.value) return ''
+
+  const fileCount = pendingChangeBatch.value.fileCount
+  return `${fileCount} file change${fileCount === 1 ? '' : 's'} pending since last approval · +${pendingChangeBatch.value.addedLines} -${pendingChangeBatch.value.removedLines}`
+})
+
+const hasRunSnapshot = computed(() => runSnapshotStatus.value.available)
+
+const runSnapshotSummary = computed(() => {
+  if (!hasRunSnapshot.value) return ''
+
+  const createdAt = runSnapshotStatus.value.createdAt
+    ? new Date(runSnapshotStatus.value.createdAt).toLocaleString()
+    : 'unknown time'
+  const fileCount = Number(runSnapshotStatus.value.changedFiles) || 0
+  const directoryCount = Number(runSnapshotStatus.value.changedDirectories) || 0
+  const fileLabel = `${fileCount} file change${fileCount === 1 ? '' : 's'}`
+
+  if (!directoryCount) {
+    return `Snapshot from ${createdAt} · ${fileLabel}`
+  }
+
+  return `Snapshot from ${createdAt} · ${fileLabel} and ${directoryCount} director${directoryCount === 1 ? 'y' : 'ies'}`
+})
+
+const showStalledRunRecovery = computed(() => {
+  return stalledRunState.value.active && stalledRunState.value.runId === activeRunId.value
 })
 
 const composerHint = computed(() => {
@@ -1359,9 +1501,53 @@ const githubStatusLoginAvailable = computed(() => {
   return githubStatus.value.available && !githubStatus.value.authenticated
 })
 
-const previewLanguage = computed(() => detectPreviewLanguage(previewState.value.path))
+const previewHasDiff = computed(() => Boolean(previewState.value.diffContent))
+
+const previewMode = computed(() => {
+  if (previewState.value.activeMode === 'diff' && previewHasDiff.value) return 'diff'
+  return 'file'
+})
+
+const previewLanguage = computed(() => {
+  if (previewMode.value === 'diff') return 'diff'
+  return detectPreviewLanguage(previewState.value.path)
+})
+
+const previewContentToCopy = computed(() => {
+  return previewMode.value === 'diff'
+    ? (previewState.value.diffContent || '')
+    : (previewState.value.content || '')
+})
+
+const previewDiffLines = computed(() => {
+  if (!previewHasDiff.value) return []
+
+  return String(previewState.value.diffContent || '')
+    .split(/\r?\n/)
+    .map((line, index) => {
+      let kind = 'context'
+
+      if (line.startsWith('diff --git ') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) {
+        kind = 'meta'
+      } else if (line.startsWith('@@')) {
+        kind = 'hunk'
+      } else if (line.startsWith('+')) {
+        kind = 'added'
+      } else if (line.startsWith('-')) {
+        kind = 'removed'
+      }
+
+      return {
+        id: `preview-diff-${index}`,
+        text: line || ' ',
+        kind,
+      }
+    })
+})
 
 const highlightedPreviewContent = computed(() => {
+  if (previewMode.value === 'diff') return ''
+
   const content = previewState.value.content || ''
   if (!content) return ''
 
@@ -1375,6 +1561,45 @@ const highlightedPreviewContent = computed(() => {
     return escapeHtml(content)
   }
 })
+
+function clearRunStallTimer() {
+  if (runStallTimer) {
+    clearTimeout(runStallTimer)
+    runStallTimer = null
+  }
+}
+
+function armRunStallTimer(runId, turnId) {
+  clearRunStallTimer()
+  stalledRunState.value = { active: false, runId: '', turnId: '', since: 0 }
+
+  runStallTimer = setTimeout(() => {
+    if (!isRunning.value) return
+    if (activeRunId.value !== runId) return
+    stalledRunState.value = {
+      active: true,
+      runId,
+      turnId,
+      since: Date.now(),
+    }
+  }, RUN_STALL_TIMEOUT_MS)
+}
+
+function markRunActivity(runId, turnId) {
+  if (activeRunId.value !== runId) return
+  stalledRunState.value = { active: false, runId: '', turnId: '', since: 0 }
+  armRunStallTimer(runId, turnId)
+}
+
+function resetActiveRunUiState() {
+  clearRunStallTimer()
+  stalledRunState.value = { active: false, runId: '', turnId: '', since: 0 }
+  isRunning.value = false
+  isCancelling.value = false
+  activeToolState.value = { tool: '', cancelling: false }
+  activeRunId.value = ''
+  activeRunSession.value = null
+}
 
 // ─── Methods ─────────────────────────────────────────────────────────────────
 
@@ -1420,6 +1645,7 @@ async function pickFolder() {
     workingDir.value = folder
     localStorage.setItem('bliss_working_dir', folder)
     await refreshGitHubStatus()
+    await refreshRunSnapshotStatus()
   }
 }
 
@@ -1519,7 +1745,9 @@ function buildActiveChatSnapshot() {
     workflowExpandedByTurn: toIpcSafe(workflowExpandedByTurn.value),
     stoppedTurns: toIpcSafe(stoppedTurns.value),
     latestWorkflowTurnId: latestWorkflowTurnId.value,
+    chatTaskMode: chatTaskMode.value,
     approvalPolicy: toIpcSafe(approvalPolicy.value),
+    pendingChangeBatch: toIpcSafe(pendingChangeBatch.value),
     conversationModelProvider: conversationModelProvider.value,
     conversationModelLabel: conversationModelLabel.value,
     conversationModelMeta: conversationModelMeta.value,
@@ -1553,10 +1781,13 @@ function applyChatSession(session) {
   workflowExpandedByTurn.value = session.workflowExpandedByTurn || {}
   stoppedTurns.value = session.stoppedTurns || {}
   latestWorkflowTurnId.value = session.latestWorkflowTurnId || null
+  chatTaskMode.value = session.chatTaskMode || ''
   activeRunId.value = ''
   isCancelling.value = false
   activeToolState.value = { tool: '', cancelling: false }
   approvalPolicy.value = session.approvalPolicy || { allowAll: false, allowedTools: {} }
+  pendingChangeBatch.value = normalizeChangeBatchState(session.pendingChangeBatch)
+  changeBatchAction.value = ''
   conversationModelProvider.value = session.conversationModelProvider || ''
   conversationModelLabel.value = session.conversationModelLabel || ''
   conversationModelMeta.value = session.conversationModelMeta || ''
@@ -1671,6 +1902,7 @@ async function deleteChat(chatId) {
     chatSessions.value = [replacement]
     activeChatId.value = replacement.id
     applyChatSession(replacement)
+    saveChatSessions()
     await refreshGitHubStatus()
     nextTick(() => inputEl.value?.focus())
     return
@@ -1679,13 +1911,17 @@ async function deleteChat(chatId) {
   const remainingChats = chatSessions.value.filter((entry) => entry.id !== chatId)
   chatSessions.value = remainingChats
 
-  if (chatId !== activeChatId.value) return
+  if (chatId !== activeChatId.value) {
+    saveChatSessions()
+    return
+  }
 
   const nextChat = remainingChats[chatIndex] || remainingChats[chatIndex - 1] || remainingChats[0]
   if (!nextChat) return
 
   activeChatId.value = nextChat.id
   applyChatSession(nextChat)
+  saveChatSessions()
   await refreshGitHubStatus()
   nextTick(() => inputEl.value?.focus())
 }
@@ -1732,6 +1968,12 @@ function getTurnValidationRuns(turnId) {
 
 function getTurnIterationState(turnId) {
   return iterationStateByTurn.value[turnId] || null
+}
+
+function normalizeIterationIntentLabel(intent) {
+  const normalized = String(intent || '').trim().toLowerCase()
+  if (!normalized || normalized === 'unknown') return ''
+  return normalized
 }
 
 function getWorkflowIterationLabel(turnId) {
@@ -1833,10 +2075,11 @@ function getWorkflowLines(turnId) {
   }
 
   if (iterationState?.max) {
+    const iterationIntent = normalizeIterationIntentLabel(iterationState.intent)
     entries.push({
       id: `iteration-${turnId}`,
       label: 'Loop',
-      text: `Iteration ${iterationState.current}/${iterationState.max}${iterationState.intent ? ` · ${iterationState.intent}` : ''}`,
+      text: `Iteration ${iterationState.current}/${iterationState.max}${iterationIntent ? ` · ${iterationIntent}` : ''}`,
       tone: 'neutral',
     })
   }
@@ -1925,9 +2168,165 @@ function handleWindowFocus() {
 
 function clearPreview() {
   previewOpen.value = false
-  previewState.value = { path: '', content: '', startLine: 0, endLine: 0, focusLine: null, totalLines: 0 }
+  previewState.value = createEmptyPreviewState()
   previewError.value = ''
   previewCopyState.value = ''
+}
+
+function createEmptyPreviewState() {
+  return {
+    path: '',
+    content: '',
+    startLine: 0,
+    endLine: 0,
+    focusLine: null,
+    totalLines: 0,
+    diffContent: '',
+    addedLines: 0,
+    removedLines: 0,
+    activeMode: 'file',
+  }
+}
+
+function createEmptyChangeBatchState() {
+  return {
+    pending: false,
+    fileCount: 0,
+    changeCount: 0,
+    addedLines: 0,
+    removedLines: 0,
+    changes: [],
+    updatedAt: 0,
+    workingDir: '',
+  }
+}
+
+function createEmptyRunSnapshotState() {
+  return {
+    available: false,
+    repoRoot: '',
+    workingDir: '',
+    refName: '',
+    runId: '',
+    chatId: '',
+    createdAt: 0,
+    changedFiles: 0,
+    changedDirectories: 0,
+  }
+}
+
+function normalizeRunSnapshotState(snapshot) {
+  if (!snapshot?.available) {
+    return createEmptyRunSnapshotState()
+  }
+
+  return {
+    available: true,
+    repoRoot: snapshot.repoRoot || '',
+    workingDir: snapshot.workingDir || '',
+    refName: snapshot.refName || '',
+    runId: snapshot.runId || '',
+    chatId: snapshot.chatId || '',
+    createdAt: Number(snapshot.createdAt) || 0,
+    changedFiles: Number(snapshot.changedFiles) || 0,
+    changedDirectories: Number(snapshot.changedDirectories) || 0,
+  }
+}
+
+function normalizeChangeBatchState(batch) {
+  const changes = Array.isArray(batch?.changes)
+    ? batch.changes
+        .filter((entry) => entry && typeof entry.path === 'string' && entry.path.trim())
+        .map((entry) => ({
+          path: entry.path,
+          diff: typeof entry.diff === 'string' ? entry.diff : '',
+          addedLines: Number(entry.addedLines) || 0,
+          removedLines: Number(entry.removedLines) || 0,
+          originalContent: typeof entry.originalContent === 'string' ? entry.originalContent : '',
+          currentContent: typeof entry.currentContent === 'string' ? entry.currentContent : '',
+          existedBefore: Boolean(entry.existedBefore),
+          existsNow: Boolean(entry.existsNow),
+        }))
+    : []
+
+  const addedLines = changes.reduce((total, entry) => total + entry.addedLines, 0)
+  const removedLines = changes.reduce((total, entry) => total + entry.removedLines, 0)
+
+  return {
+    pending: Boolean(batch?.pending) && changes.length > 0,
+    fileCount: changes.length,
+    changeCount: Number(batch?.changeCount) || addedLines + removedLines,
+    addedLines,
+    removedLines,
+    changes,
+    updatedAt: Number(batch?.updatedAt) || 0,
+    workingDir: batch?.workingDir || '',
+  }
+}
+
+function applyChangeBatchState(batch) {
+  pendingChangeBatch.value = normalizeChangeBatchState(batch)
+
+  const currentPreviewPath = previewState.value.path
+  if (!currentPreviewPath) return
+
+  const matchingChange = pendingChangeBatch.value.changes.find((entry) => entry.path === currentPreviewPath)
+  previewState.value = {
+    ...previewState.value,
+    diffContent: matchingChange?.diff || '',
+    addedLines: matchingChange?.addedLines || 0,
+    removedLines: matchingChange?.removedLines || 0,
+    activeMode: matchingChange
+      ? previewState.value.activeMode
+      : previewState.value.activeMode === 'diff'
+        ? 'file'
+        : previewState.value.activeMode,
+  }
+}
+
+async function refreshPreviewAfterBatchAction(previousBatch, nextBatch) {
+  const currentPreviewPath = previewState.value.path
+  if (!currentPreviewPath || !window.electronAPI?.previewFile || !workingDir.value) {
+    applyChangeBatchState(nextBatch)
+    return
+  }
+
+  const previousChanges = Array.isArray(previousBatch?.changes) ? previousBatch.changes : []
+  const hadPreviewedChange = previousChanges.some((entry) => entry.path === currentPreviewPath)
+  if (!hadPreviewedChange) {
+    applyChangeBatchState(nextBatch)
+    return
+  }
+
+  const nextState = normalizeChangeBatchState(nextBatch)
+  const nextMatchingChange = nextState.changes.find((entry) => entry.path === currentPreviewPath)
+
+  try {
+    const result = await window.electronAPI.previewFile({
+      workingDir: workingDir.value,
+      path: currentPreviewPath,
+      lineNumber: previewState.value.focusLine || null,
+    })
+
+    if (!result?.success) {
+      clearPreview()
+      pendingChangeBatch.value = nextState
+      return
+    }
+
+    previewState.value = {
+      ...previewState.value,
+      ...result,
+      diffContent: nextMatchingChange?.diff || '',
+      addedLines: nextMatchingChange?.addedLines || 0,
+      removedLines: nextMatchingChange?.removedLines || 0,
+      activeMode: nextMatchingChange && previewState.value.activeMode === 'diff' ? 'diff' : 'file',
+    }
+    pendingChangeBatch.value = nextState
+  } catch {
+    clearPreview()
+    pendingChangeBatch.value = nextState
+  }
 }
 
 function getPreviewWidthBounds() {
@@ -1992,10 +2391,10 @@ function detectPreviewLanguage(filePath) {
 }
 
 async function copyPreviewContent() {
-  if (!previewState.value.content) return
+  if (!previewContentToCopy.value) return
 
   try {
-    await navigator.clipboard.writeText(previewState.value.content)
+    await navigator.clipboard.writeText(previewContentToCopy.value)
     previewCopyState.value = 'Copied'
   } catch {
     previewCopyState.value = 'Copy failed'
@@ -2010,6 +2409,12 @@ function summarizeActivityResult(result) {
   if (!result) return ''
   if (result.toolCancelled) return result.message || 'Tool cancelled'
   if (!result.success) return result.error || result.stderr || 'Command failed'
+  const changedFiles = getChangedFilesFromResult(result)
+  if (changedFiles.length) {
+    const addedLines = changedFiles.reduce((total, entry) => total + (Number(entry.addedLines) || 0), 0)
+    const removedLines = changedFiles.reduce((total, entry) => total + (Number(entry.removedLines) || 0), 0)
+    return `${changedFiles.length} file change${changedFiles.length === 1 ? '' : 's'} · +${addedLines} -${removedLines}`
+  }
   if (result.stdout) return result.stdout.trim().slice(0, 160)
   if (result.message) return result.message
   return 'Completed'
@@ -2022,6 +2427,7 @@ function recordActivity(listRef, tool, result, label, turnId) {
     label,
     success: Boolean(result?.success),
     summary: summarizeActivityResult(result),
+    changedFiles: getChangedFilesFromResult(result),
   })
   listRef.value = listRef.value.slice(0, 24)
 }
@@ -2211,6 +2617,43 @@ async function stopRun() {
   }
 }
 
+async function forceReleaseStalledRun() {
+  const session = activeRunSession.value
+  if (!session?.runId) return
+
+  session.detached = true
+
+  try {
+    if (window.electronAPI?.cancelAgentRun) {
+      await window.electronAPI.cancelAgentRun({ runId: session.runId })
+    }
+  } catch {
+  }
+
+  try {
+    session.cleanup?.()
+  } catch {
+  }
+
+  stoppedTurns.value = {
+    ...stoppedTurns.value,
+    [session.turnId]: true,
+  }
+  resolveApprovalMessagesForTurn(session.turnId, 'cancelled')
+  workflowExpandedByTurn.value = {
+    ...workflowExpandedByTurn.value,
+    [session.turnId]: false,
+  }
+  resetActiveRunUiState()
+  displayMessages.value.push({
+    type: 'assistant',
+    content: 'Run released locally after stalling. A cancellation request was sent to the backend.',
+    turnId: session.turnId,
+  })
+  await scrollToBottom()
+  nextTick(() => inputEl.value?.focus())
+}
+
 async function stopActiveTool() {
   if (!activeRunId.value || !activeToolState.value.tool || !window.electronAPI?.cancelAgentTool) return
 
@@ -2294,12 +2737,19 @@ async function runTurn(userText, mode = 'send', options = {}) {
 
   isRunning.value = true
   isCancelling.value = false
+  let activatedImplementationFlow = mode === 'steer'
+  const runSession = { runId, turnId, cleanup: () => {}, detached: false }
+  activeRunSession.value = runSession
+  armRunStallTimer(runId, turnId)
   let cleanup = () => {}
 
   try {
     if (window.electronAPI.onAgentUpdate) {
       cleanup = window.electronAPI.onAgentUpdate((update) => {
         if (update?.runId && update.runId !== runId) return
+        if (runSession.detached) return
+
+        markRunActivity(runId, turnId)
 
         if (update.type === 'thinking') {
           setThinkingIndicator(turnId, true, update.text || 'Thinking...')
@@ -2318,12 +2768,19 @@ async function runTurn(userText, mode = 'send', options = {}) {
           recordModelResponse(update, turnId)
         } else if (update.type === 'iteration') {
           setThinkingIndicator(turnId, true)
+          const normalizedIntent = String(update.intent || '').trim().toLowerCase() === 'unknown'
+            ? ''
+            : (update.intent || '')
+          if (String(normalizedIntent).trim().toLowerCase() === 'implement') {
+            activatedImplementationFlow = true
+            chatTaskMode.value = 'implement'
+          }
           iterationStateByTurn.value = {
             ...iterationStateByTurn.value,
             [turnId]: {
               current: Number(update.current) || 0,
               max: Number(update.max) || 0,
-              intent: update.intent || '',
+              intent: normalizedIntent,
             },
           }
         } else if (update.type === 'assistant_partial') {
@@ -2331,16 +2788,24 @@ async function runTurn(userText, mode = 'send', options = {}) {
           upsertAssistantMessage(turnId, update.content, { isStreaming: true })
         } else if (update.type === 'approval_required') {
           setThinkingIndicator(turnId, false)
+          activatedImplementationFlow = true
+          chatTaskMode.value = 'implement'
+          finalizeStreamingAssistantMessageForTurn(turnId)
           upsertApprovalMessage(turnId, update)
         } else if (update.type === 'approval_auto_approved') {
           setThinkingIndicator(turnId, false)
+          activatedImplementationFlow = true
+          chatTaskMode.value = 'implement'
+          finalizeStreamingAssistantMessageForTurn(turnId)
           const approvalMessage = upsertApprovalMessage(turnId, update)
           approvalMessage.resolved = true
           approvalMessage.decision = update.decision || 'approved'
           approvalMessage.submitting = false
         } else if (update.type === 'tool') {
           setThinkingIndicator(turnId, false)
-          clearStreamingAssistantMessageForTurn(turnId)
+          activatedImplementationFlow = true
+          chatTaskMode.value = 'implement'
+          finalizeStreamingAssistantMessageForTurn(turnId)
           displayMessages.value.push({ type: 'tool', tool: update.tool, args: update.args, result: null, progress: null, turnId, showAllItems: false })
         } else if (update.type === 'tool_progress') {
           setThinkingIndicator(turnId, false)
@@ -2359,17 +2824,24 @@ async function runTurn(userText, mode = 'send', options = {}) {
             recordActivity(validationRuns, update.tool, update.result, update.tool.replace('run_', '').toUpperCase(), turnId)
           }
 
-          if (['git_status', 'git_diff', 'git_create_branch', 'git_add', 'git_commit'].includes(update.tool)) {
+          if (['apply_patch', 'write_file', 'git_status', 'git_diff', 'git_create_branch', 'git_add', 'git_commit'].includes(update.tool)) {
             recordActivity(changeEvents, update.tool, update.result, update.tool.replace(/_/g, ' '), turnId)
           }
+        } else if (update.type === 'change_batch') {
+          activatedImplementationFlow = true
+          chatTaskMode.value = 'implement'
+          applyChangeBatchState(update.batch)
         }
         scrollToBottom()
       })
+      runSession.cleanup = cleanup
     }
 
     const payload = toIpcSafe({
       runId,
       chatId: activeChatId.value,
+      interactionMode: mode,
+      chatTaskMode: chatTaskMode.value,
       userMessage: outgoingUserText,
       history: historyForRun,
       apiKey: selectedApiKey.value,
@@ -2381,15 +2853,21 @@ async function runTurn(userText, mode = 'send', options = {}) {
 
     const result = await window.electronAPI.runAgent(payload)
 
+    if (runSession.detached) return
+
     setThinkingIndicator(turnId, false)
 
     if (result.success) {
+      if (activatedImplementationFlow) {
+        chatTaskMode.value = 'implement'
+      }
       resolveApprovalMessagesForTurn(turnId, 'approved')
       upsertAssistantMessage(turnId, result.reply, { isStreaming: false })
       const nextHistoryState = compactChatContext(result.messages, chatContextSummary.value)
       messages.value = nextHistoryState.history
       chatContextSummary.value = nextHistoryState.summary
     } else if (result.continuationRequired) {
+      chatTaskMode.value = 'implement'
       resolveApprovalMessagesForTurn(turnId, 'approved')
       if (Array.isArray(result.messages)) {
         const nextHistoryState = compactChatContext(result.messages, chatContextSummary.value)
@@ -2429,14 +2907,20 @@ async function runTurn(userText, mode = 'send', options = {}) {
       })
     }
   } catch (e) {
+    if (runSession.detached) return
     resolveApprovalMessagesForTurn(turnId, 'cancelled')
     displayMessages.value.push({ type: 'assistant', content: `**Error:** ${e.message}`, turnId })
   } finally {
     cleanup()
-    isRunning.value = false
-    isCancelling.value = false
-    activeToolState.value = { tool: '', cancelling: false }
-    activeRunId.value = ''
+    if (runSession.detached) {
+      if (activeRunSession.value === runSession) {
+        activeRunSession.value = null
+      }
+      return
+    }
+
+    resetActiveRunUiState()
+    await refreshRunSnapshotStatus()
     workflowExpandedByTurn.value = {
       ...workflowExpandedByTurn.value,
       [turnId]: false,
@@ -2608,6 +3092,15 @@ function getToolResultItemLabel(item) {
   return item?.displayPath || item?.path || ''
 }
 
+function getChangedFilesFromResult(result) {
+  if (!Array.isArray(result?.changedFiles)) return []
+  return result.changedFiles.slice(0, 50)
+}
+
+function getToolResultDisplayCount(msg) {
+  return getChangedFilesFromResult(msg?.result).length || toolResultItems(msg).length
+}
+
 function handleToolResultItemClick(item) {
   if (!item || item.previewable === false) return
   openPreview(item)
@@ -2633,6 +3126,12 @@ function visibleToolResultItems(msg) {
 }
 
 function getToolResultCountLabel(msg) {
+  const changedFiles = getChangedFilesFromResult(msg?.result)
+  if (changedFiles.length) {
+    const count = changedFiles.length
+    return `${count} file change${count === 1 ? '' : 's'}`
+  }
+
   const count = toolResultItems(msg).length
   if (!count) return ''
   if (shouldShowAllToolResultItems(msg)) return `${count} item${count === 1 ? '' : 's'}`
@@ -2649,6 +3148,11 @@ function toggleToolResultExpansion(msg) {
 
 async function openPreview(item) {
   if (!workingDir.value || !item?.path || !window.electronAPI?.previewFile) return
+
+  const requestedMode = item.previewMode === 'diff' ? 'diff' : 'file'
+  const diffContent = typeof item.diffContent === 'string' ? item.diffContent : ''
+  const addedLines = Number(item.addedLines) || 0
+  const removedLines = Number(item.removedLines) || 0
 
   if (!previewOpen.value) {
     previewWidth.value = getDefaultPreviewWidth()
@@ -2670,12 +3174,40 @@ async function openPreview(item) {
       return
     }
 
-    previewState.value = result
+    previewState.value = {
+      ...createEmptyPreviewState(),
+      ...result,
+      diffContent,
+      addedLines,
+      removedLines,
+      activeMode: diffContent && requestedMode === 'diff' ? 'diff' : 'file',
+    }
   } catch (error) {
     previewError.value = error.message
   } finally {
     previewLoading.value = false
   }
+}
+
+function setPreviewMode(mode) {
+  if (mode === 'diff' && !previewHasDiff.value) return
+
+  previewState.value = {
+    ...previewState.value,
+    activeMode: mode === 'diff' ? 'diff' : 'file',
+  }
+}
+
+async function openChangedFilePreview(change, mode = 'file') {
+  if (!change?.path) return
+
+  await openPreview({
+    path: change.path,
+    previewMode: mode,
+    diffContent: change.diff || '',
+    addedLines: change.addedLines,
+    removedLines: change.removedLines,
+  })
 }
 
 function normalizeDisplayText(value) {
@@ -2709,11 +3241,13 @@ function findLastAssistantMessageForTurn(turnId) {
     .find((message) => message.type === 'assistant' && message.turnId === turnId)
 }
 
-function clearStreamingAssistantMessageForTurn(turnId) {
-  const index = displayMessages.value.findIndex((message) => message.type === 'assistant' && message.turnId === turnId && message.isStreaming)
-  if (index === -1) return
+function finalizeStreamingAssistantMessageForTurn(turnId) {
+  const streamingMessage = [...displayMessages.value]
+    .reverse()
+    .find((message) => message.type === 'assistant' && message.turnId === turnId && message.isStreaming)
 
-  displayMessages.value.splice(index, 1)
+  if (!streamingMessage) return
+  streamingMessage.isStreaming = false
 }
 
 function findApprovalMessage(requestId) {
@@ -2780,6 +3314,7 @@ function upsertApprovalMessage(turnId, update) {
     existingMessage.title = update.title || 'Approval required'
     existingMessage.summary = update.summary || update.tool || 'Approval required'
     existingMessage.riskLevel = update.riskLevel || 'medium'
+    existingMessage.showDetails = Boolean(existingMessage.showDetails)
     return existingMessage
   }
 
@@ -2796,6 +3331,7 @@ function upsertApprovalMessage(turnId, update) {
     resolved: false,
     decision: '',
     submitting: false,
+    showDetails: false,
   }
 
   displayMessages.value.push(approvalMessage)
@@ -2811,6 +3347,17 @@ function getApprovalStatusLabel(decision) {
   return 'Awaiting decision.'
 }
 
+function isApprovalExpanded(message) {
+  if (!message) return false
+  if (!message.resolved) return true
+  return Boolean(message.showDetails)
+}
+
+function toggleApprovalMessage(message) {
+  if (!message?.resolved) return
+  message.showDetails = !Boolean(message.showDetails)
+}
+
 function resolveApprovalMessagesForTurn(turnId, decision) {
   displayMessages.value
     .filter((message) => message.type === 'approval' && message.turnId === turnId && !message.resolved)
@@ -2818,6 +3365,7 @@ function resolveApprovalMessagesForTurn(turnId, decision) {
       message.resolved = true
       message.decision = decision
       message.submitting = false
+      message.showDetails = false
     })
 }
 
@@ -2845,6 +3393,7 @@ async function respondToApproval(message, approved, options = {}) {
 
     message.resolved = true
     message.decision = options.decision || (approved ? 'approved' : 'denied')
+    message.showDetails = false
   } catch (error) {
     message.submitting = false
     displayMessages.value.push({
@@ -2872,11 +3421,173 @@ async function syncApprovalPolicyToBackend(chatId = activeChatId.value, policy =
   }
 }
 
+async function syncChangeBatchFromBackend(chatId = activeChatId.value) {
+  if (!chatId || !window.electronAPI?.getChangeBatch) {
+    applyChangeBatchState(createEmptyChangeBatchState())
+    return
+  }
+
+  if (pendingChangeBatch.value.pending && window.electronAPI?.setChangeBatch) {
+    try {
+      const restored = await window.electronAPI.setChangeBatch({
+        chatId,
+        batch: toIpcSafe({
+          ...pendingChangeBatch.value,
+          workingDir: workingDir.value || pendingChangeBatch.value.workingDir || '',
+        }),
+      })
+
+      if (restored?.success) {
+        applyChangeBatchState(restored.batch)
+        return
+      }
+    } catch {
+    }
+  }
+
+  try {
+    const result = await window.electronAPI.getChangeBatch({ chatId })
+    if (!result?.success) return
+    applyChangeBatchState(result.batch)
+  } catch {
+  }
+}
+
+async function refreshRunSnapshotStatus() {
+  if (!window.electronAPI?.getRunSnapshot) {
+    runSnapshotStatus.value = createEmptyRunSnapshotState()
+    return
+  }
+
+  if (!workingDir.value) {
+    runSnapshotStatus.value = createEmptyRunSnapshotState()
+    return
+  }
+
+  try {
+    const result = await window.electronAPI.getRunSnapshot({ workingDir: workingDir.value })
+    if (!result?.success) return
+    runSnapshotStatus.value = normalizeRunSnapshotState(result.snapshot)
+  } catch {
+    runSnapshotStatus.value = createEmptyRunSnapshotState()
+  }
+}
+
+async function undoLastRunSnapshot() {
+  if (!hasRunSnapshot.value || undoingRunSnapshot.value || isRunning.value || !window.electronAPI?.undoRunSnapshot) return
+
+  undoingRunSnapshot.value = true
+
+  try {
+    const result = await window.electronAPI.undoRunSnapshot({ workingDir: workingDir.value })
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to undo the last run')
+    }
+
+    runSnapshotStatus.value = normalizeRunSnapshotState(result.snapshot)
+    await syncChangeBatchFromBackend()
+
+    const currentPreviewPath = previewState.value.path
+    if (currentPreviewPath && window.electronAPI?.previewFile && workingDir.value) {
+      const previewResult = await window.electronAPI.previewFile({
+        workingDir: workingDir.value,
+        path: currentPreviewPath,
+        lineNumber: previewState.value.focusLine || null,
+      })
+
+      if (previewResult?.success) {
+        const matchingChange = pendingChangeBatch.value.changes.find((entry) => entry.path === currentPreviewPath)
+        previewState.value = {
+          ...previewState.value,
+          ...previewResult,
+          diffContent: matchingChange?.diff || '',
+          addedLines: matchingChange?.addedLines || 0,
+          removedLines: matchingChange?.removedLines || 0,
+          activeMode: matchingChange && previewState.value.activeMode === 'diff' ? 'diff' : 'file',
+        }
+      } else {
+        clearPreview()
+      }
+    }
+  } catch (error) {
+    displayMessages.value.push({
+      type: 'assistant',
+      content: `**Error:** ${error.message}`,
+      turnId: latestWorkflowTurnId.value || `undo-run-${Date.now()}`,
+    })
+    await scrollToBottom()
+  } finally {
+    undoingRunSnapshot.value = false
+  }
+}
+
+async function approvePendingChangeBatch() {
+  if (!activeChatId.value || !hasPendingChangeBatch.value || changeBatchAction.value || !window.electronAPI?.approveChangeBatch) return
+
+  changeBatchAction.value = 'approve'
+  const previousBatch = normalizeChangeBatchState(pendingChangeBatch.value)
+
+  try {
+    const result = await window.electronAPI.approveChangeBatch({ chatId: activeChatId.value })
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to approve pending changes')
+    }
+
+    await refreshPreviewAfterBatchAction(previousBatch, result.batch)
+  } catch (error) {
+    displayMessages.value.push({
+      type: 'assistant',
+      content: `**Error:** ${error.message}`,
+      turnId: latestWorkflowTurnId.value || `change-batch-${Date.now()}`,
+    })
+    await scrollToBottom()
+  } finally {
+    changeBatchAction.value = ''
+  }
+}
+
+async function cancelPendingChangeBatch() {
+  if (!activeChatId.value || !hasPendingChangeBatch.value || changeBatchAction.value || !window.electronAPI?.cancelChangeBatch) return
+
+  changeBatchAction.value = 'cancel'
+  const previousBatch = normalizeChangeBatchState(pendingChangeBatch.value)
+
+  try {
+    const result = await window.electronAPI.cancelChangeBatch({ chatId: activeChatId.value })
+    if (!result?.success) {
+      throw new Error(result?.error || 'Failed to cancel pending changes')
+    }
+
+    await refreshPreviewAfterBatchAction(previousBatch, result.batch)
+  } catch (error) {
+    displayMessages.value.push({
+      type: 'assistant',
+      content: `**Error:** ${error.message}`,
+      turnId: latestWorkflowTurnId.value || `change-batch-${Date.now()}`,
+    })
+    await scrollToBottom()
+  } finally {
+    changeBatchAction.value = ''
+  }
+}
+
 function upsertAssistantMessage(turnId, content, { isStreaming = false } = {}) {
-  const existingMessage = findLastAssistantMessageForTurn(turnId)
-  if (existingMessage) {
-    existingMessage.content = content
-    existingMessage.isStreaming = isStreaming
+  const lastMessageForTurn = [...displayMessages.value]
+    .reverse()
+    .find((message) => message.turnId === turnId)
+  const streamingMessage = [...displayMessages.value]
+    .reverse()
+    .find((message) => message.type === 'assistant' && message.turnId === turnId && message.isStreaming)
+
+  if (streamingMessage) {
+    streamingMessage.content = content
+    streamingMessage.isStreaming = isStreaming
+    return
+  }
+
+  if (!isStreaming && lastMessageForTurn?.type === 'assistant') {
+    lastMessageForTurn.content = content
+    lastMessageForTurn.isStreaming = false
     return
   }
 
@@ -3068,6 +3779,8 @@ function renderMarkdown(text) {
 onMounted(() => {
   inputEl.value?.focus()
   refreshGitHubStatus()
+  syncChangeBatchFromBackend()
+  refreshRunSnapshotStatus()
   window.addEventListener('keydown', handleWindowKeydown)
   window.addEventListener('focus', handleWindowFocus)
 })
@@ -3084,6 +3797,7 @@ watch([
   stoppedTurns,
   latestWorkflowTurnId,
   approvalPolicy,
+  pendingChangeBatch,
   activeChatTitle,
   activeChatTitleManuallySet,
   conversationModelProvider,
@@ -3109,6 +3823,12 @@ watch(chatSessions, () => {
 
 watch(activeChatId, () => {
   saveChatSessions()
+  syncChangeBatchFromBackend()
+  refreshRunSnapshotStatus()
+})
+
+watch(workingDir, () => {
+  refreshRunSnapshotStatus()
 })
 
 watch([approvalPolicy, activeChatId], ([nextApprovalPolicy, nextChatId]) => {
@@ -3117,6 +3837,7 @@ watch([approvalPolicy, activeChatId], ([nextApprovalPolicy, nextChatId]) => {
 
 onBeforeUnmount(() => {
   syncActiveChatSession()
+  clearRunStallTimer()
   stopPreviewResize()
   window.removeEventListener('keydown', handleWindowKeydown)
   window.removeEventListener('focus', handleWindowFocus)
@@ -3688,6 +4409,34 @@ onBeforeUnmount(() => {
   box-shadow: 0 0 8px rgba(245, 92, 122, 0.5);
 }
 
+.topbar-undo-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border: 1px solid rgba(93, 232, 193, 0.24);
+  border-radius: 999px;
+  background: rgba(93, 232, 193, 0.08);
+  color: #b8f4e5;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.topbar-undo-btn:hover:not(:disabled) {
+  background: rgba(93, 232, 193, 0.14);
+  border-color: rgba(93, 232, 193, 0.38);
+  color: #ddfff5;
+  transform: translateY(-1px);
+}
+
+.topbar-undo-btn:disabled {
+  opacity: 0.62;
+  cursor: default;
+  transform: none;
+}
+
 .provider-pill {
   display: inline-flex;
   align-items: center;
@@ -3783,6 +4532,156 @@ onBeforeUnmount(() => {
   border-color: rgba(93, 232, 193, 0.34);
   color: var(--accent-2);
   transform: translateY(-1px);
+}
+
+.change-batch-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 24px;
+  border-bottom: 1px solid rgba(245, 182, 66, 0.18);
+  background: linear-gradient(90deg, rgba(245, 182, 66, 0.12), rgba(245, 106, 106, 0.05));
+  flex-shrink: 0;
+}
+
+.change-batch-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.change-batch-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: #f5c46a;
+}
+
+.change-batch-text {
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.change-batch-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.change-batch-approve,
+.change-batch-cancel {
+  border-radius: 999px;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.change-batch-approve {
+  border: 1px solid rgba(93, 232, 193, 0.24);
+  background: rgba(93, 232, 193, 0.12);
+  color: var(--text);
+}
+
+.change-batch-cancel {
+  border: 1px solid rgba(245, 106, 106, 0.22);
+  background: rgba(245, 106, 106, 0.1);
+  color: var(--text);
+}
+
+.change-batch-approve:hover:not(:disabled) {
+  border-color: rgba(93, 232, 193, 0.42);
+  color: var(--accent-2);
+  transform: translateY(-1px);
+}
+
+.change-batch-cancel:hover:not(:disabled) {
+  border-color: rgba(245, 106, 106, 0.42);
+  color: #ffb1b1;
+  transform: translateY(-1px);
+}
+
+.run-stalled-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 10px 14px;
+  margin: 0 0 10px;
+  border: 1px solid rgba(245, 92, 122, 0.18);
+  border-radius: 16px;
+  background: linear-gradient(135deg, rgba(245, 92, 122, 0.1), rgba(245, 182, 66, 0.06));
+}
+
+.run-stalled-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.run-stalled-label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: #ffb6c3;
+}
+
+.run-stalled-text {
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.run-stalled-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.run-stalled-btn {
+  border-radius: 999px;
+  border: 1px solid rgba(245, 182, 66, 0.24);
+  background: rgba(10, 10, 15, 0.34);
+  color: #ffe0a0;
+  padding: 8px 12px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.run-stalled-btn:hover:not(:disabled) {
+  transform: translateY(-1px);
+  border-color: rgba(245, 182, 66, 0.4);
+}
+
+.run-stalled-btn.danger {
+  border-color: rgba(245, 92, 122, 0.24);
+  color: #ffc2cc;
+}
+
+.run-stalled-btn.danger:hover:not(:disabled) {
+  border-color: rgba(245, 92, 122, 0.4);
+}
+
+.run-stalled-btn:disabled {
+  opacity: 0.6;
+  cursor: default;
+  transform: none;
+}
+
+.change-batch-approve:disabled,
+.change-batch-cancel:disabled {
+  opacity: 0.56;
+  cursor: default;
+  transform: none;
 }
 
 .workspace {
@@ -4409,6 +5308,33 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
+.preview-mode-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg-3);
+}
+
+.preview-mode-btn {
+  border: 0;
+  background: transparent;
+  color: var(--text-3);
+  padding: 4px 8px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+}
+
+.preview-mode-btn.active {
+  background: rgba(122, 162, 247, 0.16);
+  color: var(--text);
+}
+
 .preview-language {
   padding: 4px 8px;
   border-radius: 999px;
@@ -4465,6 +5391,14 @@ onBeforeUnmount(() => {
   font-family: var(--font-mono);
 }
 
+.preview-stat.added {
+  color: #6dd8a5;
+}
+
+.preview-stat.removed {
+  color: #ff8c8c;
+}
+
 .preview-code {
   margin: 0;
   padding: 16px;
@@ -4483,6 +5417,42 @@ onBeforeUnmount(() => {
   display: block;
   user-select: text;
   -webkit-user-select: text;
+}
+
+.preview-diff {
+  flex: 1;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.preview-diff-line {
+  padding: 0 16px;
+  white-space: pre;
+}
+
+.preview-diff-line.meta {
+  color: var(--text-3);
+}
+
+.preview-diff-line.hunk {
+  color: #8cb4ff;
+  background: rgba(122, 162, 247, 0.08);
+}
+
+.preview-diff-line.added {
+  color: #d7ffe8;
+  background: rgba(59, 193, 123, 0.14);
+}
+
+.preview-diff-line.removed {
+  color: #ffe1e1;
+  background: rgba(255, 107, 107, 0.14);
+}
+
+.preview-diff-text {
+  display: block;
 }
 
 .preview-status {
@@ -4774,6 +5744,94 @@ onBeforeUnmount(() => {
 
 .tool-call-result.error { color: var(--red); }
 
+.tool-change-summary {
+  margin-bottom: 8px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.tool-change-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tool-change-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-3);
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.tool-change-main {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.tool-change-main:hover .tool-change-name {
+  color: var(--text);
+}
+
+.tool-change-name {
+  font-weight: 600;
+  color: var(--text);
+  word-break: break-word;
+}
+
+.tool-change-stats,
+.tool-change-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.tool-change-stat {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
+.tool-change-stat.added {
+  background: rgba(59, 193, 123, 0.16);
+  color: #89e0b1;
+}
+
+.tool-change-stat.removed {
+  background: rgba(255, 107, 107, 0.16);
+  color: #ff9e9e;
+}
+
+.tool-change-action {
+  border: 1px solid var(--border);
+  background: rgba(255,255,255,0.02);
+  color: var(--text-2);
+  border-radius: 7px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 10px;
+  font-family: var(--font-mono);
+}
+
+.tool-change-action:hover {
+  border-color: var(--accent);
+  color: var(--text);
+}
+
 .approval-card {
   min-width: 0;
   max-width: min(100%, 640px);
@@ -4804,6 +5862,12 @@ onBeforeUnmount(() => {
   gap: 8px;
 }
 
+.approval-head-meta {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
 .approval-title {
   color: var(--text);
   font-size: 11px;
@@ -4815,6 +5879,20 @@ onBeforeUnmount(() => {
   color: #f3c97c;
   font-size: 9px;
   letter-spacing: 0.08em;
+}
+
+.approval-chevron {
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1;
+}
+
+.approval-card.clickable {
+  cursor: pointer;
+}
+
+.approval-card.clickable:hover {
+  border-color: rgba(255,255,255,0.18);
 }
 
 .approval-summary,

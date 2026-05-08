@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, dialog } = require('electron')
 const path = require('path')
 const fs = require('fs')
+const os = require('os')
 const { exec, execFile, spawn, fork } = require('child_process')
 const https = require('https')
 
@@ -8,8 +9,14 @@ const isDev = process.env.NODE_ENV === 'development' || !app.isPackaged
 const TOOL_WORKER_PATH = path.join(__dirname, 'tool-worker.js')
 const activeAgentRuns = new Map()
 const chatApprovalPolicies = new Map()
+const chatChangeBatches = new Map()
+const repoRunSnapshots = new Map()
 const providerModelCursor = new Map()
 const providerModelAvailability = new Map()
+const RUN_SNAPSHOT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000
+let runSnapshotsLoaded = false
+let changeBatchesLoaded = false
+let approvalPoliciesLoaded = false
 
 const OPENROUTER_MODEL_CANDIDATES = [
   'qwen/qwen3-coder:free',
@@ -101,7 +108,12 @@ function getProviderCursorKey(senderId, provider) {
 
 function getChatApprovalPolicyKey(senderId, chatId) {
   if (!chatId) return ''
-  return `${senderId}:${chatId}`
+  return `chat:${chatId}`
+}
+
+function getChatChangeBatchKey(senderId, chatId) {
+  if (!chatId) return ''
+  return `chat:${chatId}`
 }
 
 function normalizeApprovalPolicy(policy) {
@@ -118,6 +130,50 @@ function normalizeApprovalPolicy(policy) {
   return {
     allowAll: Boolean(policy?.allowAll),
     allowedTools,
+  }
+}
+
+function getApprovalPoliciesStatePath() {
+  return path.join(app.getPath('userData'), 'approval-policies.json')
+}
+
+function persistApprovalPoliciesToDisk() {
+  try {
+    const statePath = getApprovalPoliciesStatePath()
+    const payload = {
+      policies: Array.from(chatApprovalPolicies.entries()).map(([key, policy]) => ({
+        key,
+        policy: normalizeApprovalPolicy(policy),
+      })),
+    }
+    fs.mkdirSync(path.dirname(statePath), { recursive: true })
+    fs.writeFileSync(statePath, JSON.stringify(payload, null, 2), 'utf-8')
+  } catch (error) {
+    logMain('Failed to persist approval policies', error.message)
+  }
+}
+
+function ensureApprovalPoliciesLoaded() {
+  if (approvalPoliciesLoaded) return
+  approvalPoliciesLoaded = true
+
+  try {
+    const statePath = getApprovalPoliciesStatePath()
+    if (!fs.existsSync(statePath)) return
+
+    const raw = fs.readFileSync(statePath, 'utf-8')
+    const parsed = JSON.parse(raw)
+    const policies = Array.isArray(parsed?.policies) ? parsed.policies : []
+
+    for (const entry of policies) {
+      if (!entry || typeof entry.key !== 'string' || !entry.key.trim()) continue
+      const normalized = normalizeApprovalPolicy(entry.policy)
+      const hasExplicitRules = normalized.allowAll || Object.keys(normalized.allowedTools).length > 0
+      if (!hasExplicitRules) continue
+      chatApprovalPolicies.set(entry.key.trim(), normalized)
+    }
+  } catch (error) {
+    logMain('Failed to load approval policies', error.message)
   }
 }
 
@@ -151,6 +207,7 @@ function buildApprovalPolicyForScope(policy, toolName, scope) {
 }
 
 function getStoredChatApprovalPolicy(senderId, chatId) {
+  ensureApprovalPoliciesLoaded()
   const policyKey = getChatApprovalPolicyKey(senderId, chatId)
   if (!policyKey || !chatApprovalPolicies.has(policyKey)) {
     return normalizeApprovalPolicy(null)
@@ -160,6 +217,7 @@ function getStoredChatApprovalPolicy(senderId, chatId) {
 }
 
 function setStoredChatApprovalPolicy(senderId, chatId, policy) {
+  ensureApprovalPoliciesLoaded()
   const policyKey = getChatApprovalPolicyKey(senderId, chatId)
   if (!policyKey) return normalizeApprovalPolicy(null)
 
@@ -171,6 +229,8 @@ function setStoredChatApprovalPolicy(senderId, chatId, policy) {
   } else {
     chatApprovalPolicies.delete(policyKey)
   }
+
+  persistApprovalPoliciesToDisk()
 
   return normalizedPolicy
 }
@@ -184,6 +244,444 @@ function syncApprovalPolicyToActiveRuns(senderId, chatId, policy) {
       runState.approvalPolicy = normalizedPolicy
     }
   }
+}
+
+function createEmptyChangeBatchStatus() {
+  return {
+    pending: false,
+    fileCount: 0,
+    changeCount: 0,
+    addedLines: 0,
+    removedLines: 0,
+    changes: [],
+    updatedAt: 0,
+    workingDir: '',
+  }
+}
+
+function createEmptyRunSnapshotStatus() {
+  return {
+    available: false,
+    repoRoot: '',
+    workingDir: '',
+    refName: '',
+    runId: '',
+    chatId: '',
+    createdAt: 0,
+    changedFiles: 0,
+    changedDirectories: 0,
+  }
+}
+
+function buildRunSnapshotStatus(snapshot) {
+  if (!snapshot?.repoRoot) {
+    return createEmptyRunSnapshotStatus()
+  }
+
+  return {
+    available: true,
+    repoRoot: snapshot.repoRoot,
+    workingDir: snapshot.baseDir || snapshot.repoRoot,
+    refName: snapshot.refName || '',
+    runId: snapshot.runId || '',
+    chatId: snapshot.chatId || '',
+    createdAt: Number(snapshot.createdAt) || 0,
+    changedFiles: snapshot.files instanceof Map ? snapshot.files.size : 0,
+    changedDirectories: snapshot.createdDirectories instanceof Set ? snapshot.createdDirectories.size : 0,
+  }
+}
+
+function getChangeBatchesStatePath() {
+  return path.join(app.getPath('userData'), 'change-batches.json')
+}
+
+function serializeChangeBatch(batch) {
+  return {
+    chatId: batch.chatId || '',
+    baseDir: batch.baseDir || '',
+    updatedAt: Number(batch.updatedAt) || 0,
+    changes: batch.changes instanceof Map
+      ? Array.from(batch.changes.values()).map((entry) => ({
+          path: entry.path || '',
+          originalContent: typeof entry.originalContent === 'string' ? entry.originalContent : '',
+          currentContent: typeof entry.currentContent === 'string' ? entry.currentContent : '',
+          existedBefore: Boolean(entry.existedBefore),
+          existsNow: Boolean(entry.existsNow),
+          addedLines: Number(entry.addedLines) || 0,
+          removedLines: Number(entry.removedLines) || 0,
+          diff: typeof entry.diff === 'string' ? entry.diff : '',
+        }))
+      : [],
+  }
+}
+
+function hydrateChangeBatch(entry) {
+  if (!entry || typeof entry.chatId !== 'string' || !entry.chatId.trim()) {
+    return null
+  }
+
+  const changes = Array.isArray(entry.changes)
+    ? entry.changes
+        .filter((changeEntry) => changeEntry && typeof changeEntry.path === 'string' && changeEntry.path.trim())
+        .map((changeEntry) => ({
+          path: changeEntry.path.trim(),
+          originalContent: typeof changeEntry.originalContent === 'string' ? changeEntry.originalContent : '',
+          currentContent: typeof changeEntry.currentContent === 'string' ? changeEntry.currentContent : '',
+          existedBefore: Boolean(changeEntry.existedBefore),
+          existsNow: Boolean(changeEntry.existsNow),
+          addedLines: Number(changeEntry.addedLines) || 0,
+          removedLines: Number(changeEntry.removedLines) || 0,
+          diff: typeof changeEntry.diff === 'string' ? changeEntry.diff : '',
+        }))
+    : []
+
+  if (!changes.length) return null
+
+  return {
+    chatId: entry.chatId.trim(),
+    baseDir: typeof entry.baseDir === 'string' ? entry.baseDir.trim() : '',
+    updatedAt: Number(entry.updatedAt) || Date.now(),
+    changes: new Map(changes.map((changeEntry) => [changeEntry.path, changeEntry])),
+  }
+}
+
+function persistChangeBatchesToDisk() {
+  try {
+    const statePath = getChangeBatchesStatePath()
+    const payload = {
+      batches: Array.from(chatChangeBatches.values()).map((batch) => serializeChangeBatch(batch)),
+    }
+    fs.mkdirSync(path.dirname(statePath), { recursive: true })
+    fs.writeFileSync(statePath, JSON.stringify(payload, null, 2), 'utf-8')
+  } catch (error) {
+    logMain('Failed to persist change batches', error.message)
+  }
+}
+
+function ensureChangeBatchesLoaded() {
+  if (changeBatchesLoaded) return
+  changeBatchesLoaded = true
+
+  try {
+    const statePath = getChangeBatchesStatePath()
+    if (!fs.existsSync(statePath)) return
+
+    const raw = fs.readFileSync(statePath, 'utf-8')
+    const parsed = JSON.parse(raw)
+    const batches = Array.isArray(parsed?.batches) ? parsed.batches : []
+
+    for (const batchEntry of batches) {
+      const batch = hydrateChangeBatch(batchEntry)
+      if (!batch) continue
+      chatChangeBatches.set(getChatChangeBatchKey('', batch.chatId), batch)
+    }
+  } catch (error) {
+    logMain('Failed to load persisted change batches', error.message)
+  }
+}
+
+function getRunSnapshotsStatePath() {
+  return path.join(app.getPath('userData'), 'run-snapshots.json')
+}
+
+function serializeRunSnapshot(snapshot) {
+  return {
+    repoRoot: snapshot.repoRoot || '',
+    baseDir: snapshot.baseDir || '',
+    refName: snapshot.refName || '',
+    runId: snapshot.runId || '',
+    chatId: snapshot.chatId || '',
+    senderId: snapshot.senderId || '',
+    createdAt: Number(snapshot.createdAt) || 0,
+    files: snapshot.files instanceof Map
+      ? Array.from(snapshot.files.values()).map((entry) => ({
+          path: entry.path || '',
+          originalContent: typeof entry.originalContent === 'string' ? entry.originalContent : '',
+          existedBefore: Boolean(entry.existedBefore),
+        }))
+      : [],
+    createdDirectories: snapshot.createdDirectories instanceof Set
+      ? Array.from(snapshot.createdDirectories.values())
+      : [],
+  }
+}
+
+function hydrateRunSnapshot(entry) {
+  if (!entry || typeof entry.repoRoot !== 'string' || !entry.repoRoot.trim()) {
+    return null
+  }
+
+  const files = Array.isArray(entry.files)
+    ? entry.files
+        .filter((fileEntry) => fileEntry && typeof fileEntry.path === 'string' && fileEntry.path.trim())
+        .map((fileEntry) => ({
+          path: fileEntry.path.trim(),
+          originalContent: typeof fileEntry.originalContent === 'string' ? fileEntry.originalContent : '',
+          existedBefore: Boolean(fileEntry.existedBefore),
+        }))
+    : []
+
+  const createdDirectories = Array.isArray(entry.createdDirectories)
+    ? entry.createdDirectories
+        .filter((directory) => typeof directory === 'string' && directory.trim())
+        .map((directory) => directory.trim())
+    : []
+
+  return {
+    repoRoot: entry.repoRoot.trim(),
+    baseDir: typeof entry.baseDir === 'string' && entry.baseDir.trim() ? entry.baseDir.trim() : entry.repoRoot.trim(),
+    refName: typeof entry.refName === 'string' ? entry.refName.trim() : '',
+    runId: typeof entry.runId === 'string' ? entry.runId : '',
+    chatId: typeof entry.chatId === 'string' ? entry.chatId : '',
+    senderId: Number.isFinite(Number(entry.senderId)) ? Number(entry.senderId) : (typeof entry.senderId === 'string' ? entry.senderId : ''),
+    createdAt: Number(entry.createdAt) || 0,
+    files: new Map(files.map((fileEntry) => [fileEntry.path, fileEntry])),
+    createdDirectories: new Set(createdDirectories),
+  }
+}
+
+function persistRunSnapshotsToDisk() {
+  try {
+    const statePath = getRunSnapshotsStatePath()
+    const payload = {
+      snapshots: Array.from(repoRunSnapshots.values()).map((snapshot) => serializeRunSnapshot(snapshot)),
+    }
+
+    fs.mkdirSync(path.dirname(statePath), { recursive: true })
+    fs.writeFileSync(statePath, JSON.stringify(payload, null, 2), 'utf-8')
+  } catch (error) {
+    logMain('Failed to persist run snapshots', error.message)
+  }
+}
+
+function ensureRunSnapshotsLoaded() {
+  if (runSnapshotsLoaded) return
+  runSnapshotsLoaded = true
+
+  try {
+    const statePath = getRunSnapshotsStatePath()
+    if (!fs.existsSync(statePath)) return
+
+    const raw = fs.readFileSync(statePath, 'utf-8')
+    const parsed = JSON.parse(raw)
+    const snapshots = Array.isArray(parsed?.snapshots) ? parsed.snapshots : []
+
+    for (const snapshotEntry of snapshots) {
+      const snapshot = hydrateRunSnapshot(snapshotEntry)
+      if (!snapshot) continue
+      repoRunSnapshots.set(snapshot.repoRoot, snapshot)
+    }
+  } catch (error) {
+    logMain('Failed to load persisted run snapshots', error.message)
+  }
+}
+
+function buildChatChangeBatchStatus(batch) {
+  if (!batch?.changes?.size) {
+    return createEmptyChangeBatchStatus()
+  }
+
+  const changes = Array.from(batch.changes.values())
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map((entry) => ({
+      path: entry.path,
+      addedLines: Number(entry.addedLines) || 0,
+      removedLines: Number(entry.removedLines) || 0,
+      diff: entry.diff || '',
+      originalContent: typeof entry.originalContent === 'string' ? entry.originalContent : '',
+      currentContent: typeof entry.currentContent === 'string' ? entry.currentContent : '',
+      existedBefore: Boolean(entry.existedBefore),
+      existsNow: Boolean(entry.existsNow),
+    }))
+
+  const addedLines = changes.reduce((total, entry) => total + entry.addedLines, 0)
+  const removedLines = changes.reduce((total, entry) => total + entry.removedLines, 0)
+
+  return {
+    pending: changes.length > 0,
+    fileCount: changes.length,
+    changeCount: addedLines + removedLines,
+    addedLines,
+    removedLines,
+    changes,
+    updatedAt: Number(batch.updatedAt) || Date.now(),
+    workingDir: batch.baseDir || '',
+  }
+}
+
+function setStoredChatChangeBatch(senderId, chatId, batch) {
+  ensureChangeBatchesLoaded()
+  const batchKey = getChatChangeBatchKey(senderId, chatId)
+  if (!batchKey) return createEmptyChangeBatchStatus()
+
+  const normalizedChanges = Array.isArray(batch?.changes)
+    ? batch.changes
+        .filter((entry) => entry && typeof entry.path === 'string' && entry.path.trim())
+        .map((entry) => ({
+          path: entry.path.trim(),
+          originalContent: typeof entry.originalContent === 'string' ? entry.originalContent : '',
+          currentContent: typeof entry.currentContent === 'string' ? entry.currentContent : '',
+          existedBefore: Boolean(entry.existedBefore),
+          existsNow: Boolean(entry.existsNow),
+          addedLines: Number(entry.addedLines) || 0,
+          removedLines: Number(entry.removedLines) || 0,
+          diff: typeof entry.diff === 'string' ? entry.diff : '',
+        }))
+    : []
+
+  if (!normalizedChanges.length) {
+    chatChangeBatches.delete(batchKey)
+    persistChangeBatchesToDisk()
+    return createEmptyChangeBatchStatus()
+  }
+
+  chatChangeBatches.set(batchKey, {
+    chatId,
+    baseDir: typeof batch?.workingDir === 'string' && batch.workingDir.trim()
+      ? batch.workingDir.trim()
+      : '',
+    updatedAt: Number(batch?.updatedAt) || Date.now(),
+    changes: new Map(normalizedChanges.map((entry) => [entry.path, entry])),
+  })
+
+  persistChangeBatchesToDisk()
+
+  return getStoredChatChangeBatchStatus(senderId, chatId)
+}
+
+function getStoredChatChangeBatchStatus(senderId, chatId) {
+  ensureChangeBatchesLoaded()
+  const batchKey = getChatChangeBatchKey(senderId, chatId)
+  if (!batchKey || !chatChangeBatches.has(batchKey)) {
+    return createEmptyChangeBatchStatus()
+  }
+
+  return buildChatChangeBatchStatus(chatChangeBatches.get(batchKey))
+}
+
+function clearStoredChatChangeBatch(senderId, chatId) {
+  ensureChangeBatchesLoaded()
+  const batchKey = getChatChangeBatchKey(senderId, chatId)
+  if (!batchKey) return
+  chatChangeBatches.delete(batchKey)
+  persistChangeBatchesToDisk()
+}
+
+async function registerStoredChatChangeMutation(senderId, chatId, baseDir, filePath, originalContent, updatedContent, options = {}) {
+  ensureChangeBatchesLoaded()
+  const batchKey = getChatChangeBatchKey(senderId, chatId)
+  if (!batchKey || !baseDir || !filePath) {
+    return createEmptyChangeBatchStatus()
+  }
+
+  const relativePath = toRelativeToolPath(baseDir, filePath)
+  const existingBatch = chatChangeBatches.get(batchKey) || {
+    chatId,
+    baseDir,
+    changes: new Map(),
+    updatedAt: Date.now(),
+  }
+
+  const previousEntry = existingBatch.changes.get(relativePath)
+  const baselineContent = previousEntry ? previousEntry.originalContent : String(originalContent || '')
+  const existedBefore = previousEntry
+    ? previousEntry.existedBefore
+    : Boolean(options.existedBefore)
+  const existsNow = Object.prototype.hasOwnProperty.call(options, 'existsNow')
+    ? Boolean(options.existsNow)
+    : true
+  const nextContent = String(updatedContent || '')
+  const restoredToBaseline = existedBefore === existsNow && baselineContent === nextContent
+
+  existingBatch.baseDir = baseDir
+  existingBatch.updatedAt = Date.now()
+
+  if (restoredToBaseline) {
+    existingBatch.changes.delete(relativePath)
+  } else {
+    const accumulatedChange = await buildMutationChangeRecord(baseDir, filePath, baselineContent, nextContent)
+    existingBatch.changes.set(relativePath, {
+      path: relativePath,
+      originalContent: baselineContent,
+      currentContent: nextContent,
+      existedBefore,
+      existsNow,
+      addedLines: accumulatedChange.addedLines,
+      removedLines: accumulatedChange.removedLines,
+      diff: accumulatedChange.diff,
+    })
+  }
+
+  if (existingBatch.changes.size) {
+    chatChangeBatches.set(batchKey, existingBatch)
+  } else {
+    chatChangeBatches.delete(batchKey)
+  }
+
+  persistChangeBatchesToDisk()
+
+  return getStoredChatChangeBatchStatus(senderId, chatId)
+}
+
+function approveStoredChatChangeBatch(senderId, chatId) {
+  ensureChangeBatchesLoaded()
+  const currentBatch = getStoredChatChangeBatchStatus(senderId, chatId)
+  clearStoredChatChangeBatch(senderId, chatId)
+
+  return {
+    success: true,
+    approvedFiles: currentBatch.fileCount,
+    batch: createEmptyChangeBatchStatus(),
+  }
+}
+
+function cancelStoredChatChangeBatch(senderId, chatId) {
+  ensureChangeBatchesLoaded()
+  const batchKey = getChatChangeBatchKey(senderId, chatId)
+  if (!batchKey || !chatChangeBatches.has(batchKey)) {
+    return {
+      success: true,
+      revertedFiles: 0,
+      batch: createEmptyChangeBatchStatus(),
+    }
+  }
+
+  const batch = chatChangeBatches.get(batchKey)
+  const entries = Array.from(batch.changes.values())
+
+  for (const entry of entries) {
+    const absolutePath = resolveToolPath(batch.baseDir || process.cwd(), entry.path)
+    if (entry.existedBefore) {
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true })
+      fs.writeFileSync(absolutePath, entry.originalContent, 'utf-8')
+      continue
+    }
+
+    if (fs.existsSync(absolutePath)) {
+      fs.unlinkSync(absolutePath)
+    }
+  }
+
+  clearStoredChatChangeBatch(senderId, chatId)
+
+  return {
+    success: true,
+    revertedFiles: entries.length,
+    batch: createEmptyChangeBatchStatus(),
+  }
+}
+
+function hasActiveRunForChat(senderId, chatId) {
+  if (!chatId) return false
+
+  for (const [runKey, runState] of activeAgentRuns.entries()) {
+    if (!runKey.startsWith(`${senderId}:`)) continue
+    if (runState.chatId === chatId && !runState.cancelled) {
+      return true
+    }
+  }
+
+  return false
 }
 
 function resetProviderModelCursor(cursorKey) {
@@ -315,6 +813,7 @@ function createRunDiscoveryState() {
     discoveredPaths: new Set(),
     listedDirectories: new Set(),
     readFiles: new Set(),
+    lastReadTarget: null,
   }
 }
 
@@ -368,13 +867,46 @@ function recordToolDiscovery(runState, baseDir, toolName, toolArgs, result) {
   }
 
   if (toolName === 'read_file' || toolName === 'read_file_range') {
-    recordDiscoveredPath(runState, baseDir, resolveToolPath(baseDir, toolArgs.path), { wasRead: true })
+    const resolvedPath = resolveToolPath(baseDir, toolArgs.path)
+    recordDiscoveredPath(runState, baseDir, resolvedPath, { wasRead: true })
+    runState.discovery.lastReadTarget = {
+      path: resolvedPath,
+      displayPath: toRelativeToolPath(baseDir, resolvedPath),
+      startLine: toolName === 'read_file_range'
+        ? Math.max(1, Number(result?.startLine || toolArgs?.startLine || 1))
+        : 1,
+      endLine: toolName === 'read_file_range'
+        ? Math.max(1, Number(result?.endLine || toolArgs?.endLine || 1))
+        : null,
+      usedRange: toolName === 'read_file_range',
+    }
   }
 }
 
 function ensureGroundedFileMutation(baseDir, toolName, toolArgs, runState) {
   if (!runState?.discovery) return null
   if (!['apply_patch', 'write_file', 'delete_file', 'create_directory'].includes(toolName)) return null
+
+  const validationFailureTarget = runState?.pendingValidationRecovery
+    ? runState?.lastValidationFailure?.target || null
+    : null
+
+  if (validationFailureTarget?.path) {
+    const validationTargetKey = toDiscoveryKey(baseDir, validationFailureTarget.path)
+    const validationTargetWasRead = runState.discovery.readFiles.has(validationTargetKey)
+
+    if (!validationTargetWasRead) {
+      const targetRange = Number.isFinite(validationFailureTarget.startLine) && Number.isFinite(validationFailureTarget.endLine)
+        ? `${validationFailureTarget.startLine}-${validationFailureTarget.endLine}`
+        : null
+
+      return {
+        success: false,
+        grounded: false,
+        error: `${toolName} was blocked because validation recovery is active and ${validationFailureTarget.displayPath} has not been read in this run. Read ${validationFailureTarget.displayPath}${targetRange ? ` lines ${targetRange}` : ''} first, then decide on the concrete fix.`,
+      }
+    }
+  }
 
   if (!runState.discovery.hasContext) {
     return {
@@ -518,7 +1050,12 @@ function toIpcSafe(value) {
 }
 
 function normalizeMessageContent(content) {
-  if (typeof content === 'string') return content.trim()
+  const normalizeText = (value) => String(value || '')
+    .replace(/\{\{::[a-z0-9_:-]+\}\}/gi, '')
+    .replace(/[ \t]+\n/g, '\n')
+    .trim()
+
+  if (typeof content === 'string') return normalizeText(content)
   if (Array.isArray(content)) {
     return content
       .map((part) => {
@@ -528,13 +1065,80 @@ function normalizeMessageContent(content) {
         return ''
       })
       .join('\n')
+      .replace(/\{\{::[a-z0-9_:-]+\}\}/gi, '')
+      .replace(/[ \t]+\n/g, '\n')
       .trim()
   }
   if (content && typeof content === 'object') {
-    if (typeof content.text === 'string') return content.text.trim()
-    if (typeof content.content === 'string') return content.content.trim()
+    if (typeof content.text === 'string') return normalizeText(content.text)
+    if (typeof content.content === 'string') return normalizeText(content.content)
   }
   return ''
+}
+
+function normalizeLineEndings(text) {
+  return String(text || '').replace(/\r\n/g, '\n')
+}
+
+function getPreferredLineEnding(text) {
+  return String(text || '').includes('\r\n') ? '\r\n' : '\n'
+}
+
+function applyPreferredLineEndings(text, lineEnding) {
+  if (lineEnding === '\r\n') {
+    return String(text || '').replace(/\r?\n/g, '\r\n')
+  }
+
+  return normalizeLineEndings(text)
+}
+
+function countLiteralOccurrences(text, needle) {
+  if (!needle) return 0
+  return String(text || '').split(String(needle)).length - 1
+}
+
+function resolveApplyPatchUpdate(originalContent, oldText, newText, replaceAll = false) {
+  const original = String(originalContent || '')
+  const target = String(oldText || '')
+  const replacement = String(newText || '')
+  const exactOccurrences = countLiteralOccurrences(original, target)
+
+  if (exactOccurrences > 0) {
+    if (!replaceAll && exactOccurrences > 1) {
+      return { success: false, error: 'oldText matched more than once; refine the patch target or set replaceAll' }
+    }
+
+    return {
+      success: true,
+      updated: replaceAll ? original.split(target).join(replacement) : original.replace(target, replacement),
+      replacements: replaceAll ? exactOccurrences : 1,
+      normalizedLineEndings: false,
+    }
+  }
+
+  const normalizedOriginal = normalizeLineEndings(original)
+  const normalizedTarget = normalizeLineEndings(target)
+  const normalizedReplacement = normalizeLineEndings(replacement)
+  const normalizedOccurrences = countLiteralOccurrences(normalizedOriginal, normalizedTarget)
+
+  if (normalizedOccurrences === 0) {
+    return { success: false, error: 'oldText was not found in the file' }
+  }
+
+  if (!replaceAll && normalizedOccurrences > 1) {
+    return { success: false, error: 'oldText matched more than once; refine the patch target or set replaceAll' }
+  }
+
+  const normalizedUpdated = replaceAll
+    ? normalizedOriginal.split(normalizedTarget).join(normalizedReplacement)
+    : normalizedOriginal.replace(normalizedTarget, normalizedReplacement)
+
+  return {
+    success: true,
+    updated: applyPreferredLineEndings(normalizedUpdated, getPreferredLineEnding(original)),
+    replacements: replaceAll ? normalizedOccurrences : 1,
+    normalizedLineEndings: true,
+  }
 }
 
 function extractBalancedJsonObject(text, startIndex) {
@@ -594,6 +1198,28 @@ function normalizeInlineToolArguments(value) {
   }
   if (typeof value === 'object') return value
   return {}
+}
+
+function normalizeInlineToolCallEntries(value) {
+  const entries = Array.isArray(value) ? value : [value]
+
+  return entries
+    .map((entry, index) => {
+      const toolName = normalizeRequestedToolName(entry?.name || entry?.tool || entry?.function?.name)
+      const rawArguments = entry?.arguments ?? entry?.args ?? entry?.function?.arguments ?? {}
+
+      if (!toolName) return null
+
+      return {
+        id: `inline-tool-${index + 1}`,
+        type: 'function',
+        function: {
+          name: toolName,
+          arguments: JSON.stringify(normalizeInlineToolArguments(rawArguments)),
+        }
+      }
+    })
+    .filter(Boolean)
 }
 
 function getDisplaySafeAssistantContent(content) {
@@ -743,6 +1369,11 @@ function createProviderQuotaExhaustedError(providerLabel, failedAttempts, messag
   return error
 }
 
+function isProviderTimeoutError(error) {
+  const message = String(error?.message || '').toLowerCase()
+  return /hard timeout|timed out after|request timed out|socket hang up|etimedout|econnreset/.test(message)
+}
+
 function classifyOpenRouterFallbackError(error) {
   const message = error?.message || ''
   const statusCode = Number(error?.statusCode || 0)
@@ -753,6 +1384,7 @@ function classifyOpenRouterFallbackError(error) {
     || /model not found|not a valid model|invalid model/i.test(message)
 
   const retryable = providerQuotaExhausted
+    || isProviderTimeoutError(error)
     || /No endpoints found|model not found|not a valid model|provider returned error|temporarily unavailable|rate limit/i.test(message)
     || [429, 500, 502, 503, 504].includes(statusCode)
 
@@ -770,7 +1402,16 @@ function parseInlineToolCalls(content) {
   if (!text) return []
 
   const markerPattern = /(TOOLCALL|TOOL_CALL|FUNCTIONCALL|FUNCTION_CALL|CALL)\s*>?/gi
-  if (!markerPattern.test(text)) return []
+  if (!markerPattern.test(text)) {
+    const rawJsonCandidate = extractBalancedJsonCandidate(text)
+    if (!rawJsonCandidate) return []
+
+    try {
+      return normalizeInlineToolCallEntries(JSON.parse(rawJsonCandidate))
+    } catch {
+      return []
+    }
+  }
 
   const toolCalls = []
   markerPattern.lastIndex = 0
@@ -788,20 +1429,7 @@ function parseInlineToolCalls(content) {
     if (!rawJson) break
 
     try {
-      const parsed = JSON.parse(rawJson)
-      const toolName = normalizeRequestedToolName(parsed.name || parsed.tool || parsed.function?.name)
-      const rawArguments = parsed.arguments ?? parsed.args ?? parsed.function?.arguments ?? {}
-
-      if (toolName) {
-        toolCalls.push({
-          id: `inline-tool-${toolCalls.length + 1}`,
-          type: 'function',
-          function: {
-            name: toolName,
-            arguments: JSON.stringify(normalizeInlineToolArguments(rawArguments)),
-          }
-        })
-      }
+      toolCalls.push(...normalizeInlineToolCallEntries(JSON.parse(rawJson)))
     } catch (error) {
       logMain('Failed to parse inline TOOLCALL payload', error.message)
     }
@@ -1868,6 +2496,124 @@ async function readFilePreview(baseDir, targetPath, focusLine) {
   }
 }
 
+function splitTextIntoLines(text) {
+  if (!text) return []
+  return String(text).split(/\r?\n/)
+}
+
+function estimateMutationLineStats(originalContent, updatedContent) {
+  if (originalContent === updatedContent) {
+    return { addedLines: 0, removedLines: 0 }
+  }
+
+  return {
+    addedLines: splitTextIntoLines(updatedContent).length,
+    removedLines: splitTextIntoLines(originalContent).length,
+  }
+}
+
+function parseUnifiedDiffStats(diffText) {
+  let addedLines = 0
+  let removedLines = 0
+
+  for (const line of String(diffText || '').split(/\r?\n/)) {
+    if (!line) continue
+    if (
+      line.startsWith('diff --git ')
+      || line.startsWith('index ')
+      || line.startsWith('--- ')
+      || line.startsWith('+++ ')
+      || line.startsWith('@@ ')
+      || line.startsWith('\\ No newline at end of file')
+    ) {
+      continue
+    }
+
+    if (line.startsWith('+')) {
+      addedLines += 1
+      continue
+    }
+
+    if (line.startsWith('-')) {
+      removedLines += 1
+    }
+  }
+
+  return { addedLines, removedLines }
+}
+
+function normalizeDiffRelativePath(targetPath) {
+  const normalized = String(targetPath || '')
+    .replace(/\\/g, '/')
+    .split('/')
+    .filter((segment) => segment && segment !== '.' && segment !== '..')
+    .join('/')
+
+  return normalized || 'untitled.txt'
+}
+
+async function buildUnifiedDiffText(relativePath, originalContent, updatedContent, runState) {
+  if (originalContent === updatedContent) return ''
+
+  const normalizedRelativePath = normalizeDiffRelativePath(relativePath)
+  const pathSegments = normalizedRelativePath.split('/')
+  const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'bliss-agent-diff-'))
+  const beforeRelativePath = ['a', ...pathSegments].join('/')
+  const afterRelativePath = ['b', ...pathSegments].join('/')
+  const beforeFilePath = path.join(tempDir, ...beforeRelativePath.split('/'))
+  const afterFilePath = path.join(tempDir, ...afterRelativePath.split('/'))
+
+  try {
+    await fs.promises.mkdir(path.dirname(beforeFilePath), { recursive: true })
+    await fs.promises.mkdir(path.dirname(afterFilePath), { recursive: true })
+    await fs.promises.writeFile(beforeFilePath, originalContent, 'utf-8')
+    await fs.promises.writeFile(afterFilePath, updatedContent, 'utf-8')
+
+    const diffResult = await runExecFileCommand(
+      'git',
+      ['diff', '--no-index', '--no-ext-diff', '--unified=3', '--', beforeRelativePath, afterRelativePath],
+      { cwd: tempDir, timeout: 30000, maxBuffer: 1024 * 1024 },
+      runState,
+      (error, stdout, stderr) => {
+        const exitCode = typeof error?.code === 'number' ? error.code : 0
+        const success = !error || exitCode === 1
+
+        return {
+          success,
+          stdout: stdout || '',
+          stderr: stderr || '',
+          exitCode,
+          error: success ? null : (stderr || stdout || error?.message || 'Git diff failed').trim(),
+          missing: error?.code === 'ENOENT',
+        }
+      }
+    )
+
+    if (!diffResult.success || diffResult.cancelled || diffResult.missing) {
+      return ''
+    }
+
+    return String(diffResult.stdout || '').trim()
+  } finally {
+    await fs.promises.rm(tempDir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+async function buildMutationChangeRecord(baseDir, filePath, originalContent, updatedContent, runState) {
+  const relativePath = toRelativeToolPath(baseDir, filePath)
+  const diff = await buildUnifiedDiffText(relativePath, originalContent, updatedContent, runState)
+  const stats = diff
+    ? parseUnifiedDiffStats(diff)
+    : estimateMutationLineStats(originalContent, updatedContent)
+
+  return {
+    path: relativePath,
+    addedLines: stats.addedLines,
+    removedLines: stats.removedLines,
+    diff,
+  }
+}
+
 function runHeavyToolInChildProcess(toolName, baseDir, args, onProgress, runState) {
   return new Promise((resolve) => {
     if (runState?.cancelled) {
@@ -2018,6 +2764,235 @@ async function runGitTool(baseDir, args, runState) {
   return {
     ...result,
     repoRoot: gitDir.repoRoot,
+  }
+}
+
+async function deleteRunSnapshotRef(repoRoot, refName, runState) {
+  if (!repoRoot || !refName) return
+  await runGitCommand(['update-ref', '-d', refName], repoRoot, runState)
+}
+
+async function pruneExpiredRunSnapshots(runState) {
+  ensureRunSnapshotsLoaded()
+  const now = Date.now()
+  let removedAny = false
+  for (const [repoRoot, snapshot] of repoRunSnapshots.entries()) {
+    if (!snapshot?.createdAt || now - snapshot.createdAt < RUN_SNAPSHOT_RETENTION_MS) continue
+    await deleteRunSnapshotRef(repoRoot, snapshot.refName, runState)
+    repoRunSnapshots.delete(repoRoot)
+    removedAny = true
+  }
+
+  if (removedAny) {
+    persistRunSnapshotsToDisk()
+  }
+}
+
+async function clearStoredRunSnapshot(repoRoot, runState) {
+  ensureRunSnapshotsLoaded()
+  if (!repoRoot || !repoRunSnapshots.has(repoRoot)) return
+  const existing = repoRunSnapshots.get(repoRoot)
+  await deleteRunSnapshotRef(repoRoot, existing?.refName, runState)
+  repoRunSnapshots.delete(repoRoot)
+  persistRunSnapshotsToDisk()
+}
+
+async function getStoredRunSnapshotStatus(baseDir, runState) {
+  if (!baseDir) {
+    return { success: true, snapshot: createEmptyRunSnapshotStatus() }
+  }
+
+  ensureRunSnapshotsLoaded()
+  await pruneExpiredRunSnapshots(runState)
+
+  const gitDir = await resolveGitWorkingDirectory(baseDir, runState)
+  if (!gitDir.success || gitDir.cancelled) {
+    return { success: true, snapshot: createEmptyRunSnapshotStatus() }
+  }
+
+  return {
+    success: true,
+    snapshot: buildRunSnapshotStatus(repoRunSnapshots.get(gitDir.repoRoot)),
+  }
+}
+
+async function ensureRunGitSnapshot(baseDir, runState) {
+  ensureRunSnapshotsLoaded()
+  if (runState?.gitSnapshot?.repoRoot && repoRunSnapshots.has(runState.gitSnapshot.repoRoot)) {
+    return {
+      success: true,
+      snapshot: repoRunSnapshots.get(runState.gitSnapshot.repoRoot),
+      status: buildRunSnapshotStatus(repoRunSnapshots.get(runState.gitSnapshot.repoRoot)),
+    }
+  }
+
+  const gitDir = await resolveGitWorkingDirectory(baseDir, runState)
+  if (!gitDir.success || gitDir.cancelled) {
+    return gitDir
+  }
+
+  await pruneExpiredRunSnapshots(runState)
+  await clearStoredRunSnapshot(gitDir.repoRoot, runState)
+
+  const headResult = await runGitCommand(['rev-parse', 'HEAD'], gitDir.repoRoot, runState)
+  if (!headResult.success) {
+    return {
+      success: false,
+      error: headResult.error || 'Failed to read git HEAD before snapshot.',
+      repoRoot: gitDir.repoRoot,
+    }
+  }
+
+  const createdAt = Date.now()
+  const safeRunId = String(runState?.runId || createdAt).replace(/[^a-z0-9-]+/gi, '-').replace(/^-+|-+$/g, '') || String(createdAt)
+  const refName = `refs/bliss-agent/pre-run-${createdAt}-${safeRunId}`
+  const updateRefResult = await runGitCommand(['update-ref', refName, headResult.stdout.trim()], gitDir.repoRoot, runState)
+
+  if (!updateRefResult.success) {
+    return {
+      success: false,
+      error: updateRefResult.error || 'Failed to create git snapshot ref.',
+      repoRoot: gitDir.repoRoot,
+    }
+  }
+
+  const snapshot = {
+    repoRoot: gitDir.repoRoot,
+    baseDir: baseDir || gitDir.repoRoot,
+    refName,
+    runId: runState?.runId || '',
+    chatId: runState?.chatId || '',
+    senderId: runState?.senderId || '',
+    createdAt,
+    files: new Map(),
+    createdDirectories: new Set(),
+  }
+
+  repoRunSnapshots.set(gitDir.repoRoot, snapshot)
+  persistRunSnapshotsToDisk()
+
+  if (runState) {
+    runState.gitSnapshot = {
+      repoRoot: gitDir.repoRoot,
+      refName,
+      createdAt,
+    }
+  }
+
+  return {
+    success: true,
+    snapshot,
+    status: buildRunSnapshotStatus(snapshot),
+  }
+}
+
+async function recordRunSnapshotFileBaseline(baseDir, runState, filePath, originalContent, options = {}) {
+  const ensured = await ensureRunGitSnapshot(baseDir, runState)
+  if (!ensured.success) {
+    return ensured
+  }
+
+  const snapshot = ensured.snapshot
+  const relativePath = toRelativeToolPath(snapshot.repoRoot, filePath)
+
+  if (!snapshot.files.has(relativePath)) {
+    snapshot.files.set(relativePath, {
+      path: relativePath,
+      originalContent: typeof originalContent === 'string' ? originalContent : '',
+      existedBefore: Boolean(options.existedBefore),
+    })
+    persistRunSnapshotsToDisk()
+  }
+
+  snapshot.baseDir = baseDir || snapshot.baseDir || snapshot.repoRoot
+
+  return {
+    success: true,
+    snapshot,
+    status: buildRunSnapshotStatus(snapshot),
+  }
+}
+
+async function recordRunSnapshotDirectoryCreation(baseDir, runState, directoryPath) {
+  const ensured = await ensureRunGitSnapshot(baseDir, runState)
+  if (!ensured.success) {
+    return ensured
+  }
+
+  const snapshot = ensured.snapshot
+  snapshot.createdDirectories.add(toRelativeToolPath(snapshot.repoRoot, directoryPath))
+  snapshot.baseDir = baseDir || snapshot.baseDir || snapshot.repoRoot
+  persistRunSnapshotsToDisk()
+
+  return {
+    success: true,
+    snapshot,
+    status: buildRunSnapshotStatus(snapshot),
+  }
+}
+
+async function undoStoredRunSnapshot(baseDir, runState) {
+  const gitDir = await resolveGitWorkingDirectory(baseDir, runState)
+  if (!gitDir.success || gitDir.cancelled) {
+    return gitDir
+  }
+
+  await pruneExpiredRunSnapshots(runState)
+
+  const snapshot = repoRunSnapshots.get(gitDir.repoRoot)
+  if (!snapshot) {
+    return {
+      success: true,
+      revertedFiles: 0,
+      revertedDirectories: 0,
+      snapshot: createEmptyRunSnapshotStatus(),
+    }
+  }
+
+  const fileEntries = Array.from(snapshot.files.values())
+  const directoryEntries = Array.from(snapshot.createdDirectories.values())
+    .sort((left, right) => right.length - left.length)
+  const effectiveSenderId = runState?.senderId || snapshot.senderId
+
+  for (const entry of fileEntries) {
+    const absolutePath = resolveToolPath(snapshot.repoRoot, entry.path)
+    const existedBeforeUndo = fs.existsSync(absolutePath)
+    const currentContent = existedBeforeUndo && fs.statSync(absolutePath).isFile()
+      ? fs.readFileSync(absolutePath, 'utf-8')
+      : ''
+
+    if (entry.existedBefore) {
+      fs.mkdirSync(path.dirname(absolutePath), { recursive: true })
+      fs.writeFileSync(absolutePath, entry.originalContent, 'utf-8')
+    } else if (existedBeforeUndo) {
+      fs.unlinkSync(absolutePath)
+    }
+
+    if (effectiveSenderId && snapshot.chatId) {
+      await registerStoredChatChangeMutation(effectiveSenderId, snapshot.chatId, snapshot.baseDir || snapshot.repoRoot, absolutePath, currentContent, entry.existedBefore ? entry.originalContent : '', {
+        existedBefore: existedBeforeUndo,
+        existsNow: entry.existedBefore,
+      })
+    }
+  }
+
+  let revertedDirectories = 0
+  for (const relativeDirectory of directoryEntries) {
+    const absoluteDirectory = resolveToolPath(snapshot.repoRoot, relativeDirectory)
+    if (!fs.existsSync(absoluteDirectory)) continue
+    if (!fs.statSync(absoluteDirectory).isDirectory()) continue
+    if (fs.readdirSync(absoluteDirectory).length > 0) continue
+    fs.rmdirSync(absoluteDirectory)
+    revertedDirectories += 1
+  }
+
+  await clearStoredRunSnapshot(gitDir.repoRoot, runState)
+
+  return {
+    success: true,
+    revertedFiles: fileEntries.length,
+    revertedDirectories,
+    snapshot: createEmptyRunSnapshotStatus(),
   }
 }
 
@@ -2375,17 +3350,29 @@ function repairCommonToolArgumentJsonIssues(rawArguments) {
     .trim()
     .replace(/[\u201C\u201D]/g, '"')
     .replace(/[\u2018\u2019]/g, "'")
+    .replace(/([{,]\s*)'([^'\\]*(?:\\.[^'\\]*)*)'(\s*:)/g, '$1"$2"$3')
     .replace(/([{,]\s*)([A-Za-z_$][\w$-]*)(\s*:)/g, '$1"$2"$3')
     .replace(/:\s*'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_, value) => `: ${JSON.stringify(value.replace(/\\'/g, "'"))}`)
+    .replace(/:\s*([A-Za-z0-9_./\\:-]+)(?=(?:\s*(,|}|\]))|(?:\s*(?=(?:"?[A-Za-z_$][\w$-]*"?\s*:))))/g, (_, value) => {
+      if (/^(true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)$/i.test(value)) {
+        return `: ${value}`
+      }
+
+      return `: ${JSON.stringify(value)}`
+    })
     .replace(/,\s*([}\]])/g, '$1')
-    .replace(/("(?:\\.|[^"])*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[}\]])\s+(?=(?:"?[A-Za-z_$][\w$-]*"?\s*:))/g, '$1, ')
+    .replace(/("(?:\\.|[^"])*"|true|false|null|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|[}\]])\s*(?=(?:"?[A-Za-z_$][\w$-]*"?\s*:))/g, '$1, ')
+}
+
+function shouldAttemptBasicToolArgumentRepair(rawText) {
+  return Boolean(rawText) && rawText.length <= 12000
 }
 
 function shouldAttemptExpensiveToolArgumentRepair(toolName, rawText) {
   const normalizedToolName = String(toolName || '').trim()
   if (!rawText) return false
   if (rawText.length > 4000) return false
-  if (normalizedToolName === 'write_file' || normalizedToolName === 'apply_patch') return false
+  if (normalizedToolName === 'write_file') return false
   if (/("content"\s*:|"newText"\s*:|"oldText"\s*:)/.test(rawText)) return false
   return true
 }
@@ -2410,6 +3397,13 @@ function parseToolArguments(toolName, rawArguments) {
   const unfenced = stripToolArgumentCodeFence(rawText)
   addCandidate(unfenced)
   addCandidate(extractBalancedJsonCandidate(unfenced))
+
+  if (shouldAttemptBasicToolArgumentRepair(rawText)) {
+    const baseCandidates = candidates.slice()
+    for (const candidate of baseCandidates) {
+      addCandidate(repairCommonToolArgumentJsonIssues(candidate.text), true)
+    }
+  }
 
   if (shouldAttemptExpensiveToolArgumentRepair(toolName, rawText)) {
     const baseCandidates = candidates.slice()
@@ -2449,11 +3443,14 @@ const VERIFICATION_TOOL_NAMES = new Set(['read_file', 'read_file_range', 'git_di
 const AUTO_RECOVERY_VALIDATION_TOOL_NAMES = new Set(['run_build', 'run_test', 'run_lint'])
 const NON_EXECUTION_INTENT_NAMES = new Set(['read', 'explain', 'review'])
 const MAX_AUTOMATIC_VALIDATION_RECOVERY_ATTEMPTS = 3
+const MAX_TOOL_ENFORCEMENT_ATTEMPTS = 4
+const MAX_PROVIDER_TIMEOUT_RECOVERY_ATTEMPTS = 2
 const MAX_TOOL_ARGUMENT_PAYLOAD_LENGTH = 120000
+const PROVIDER_REQUEST_HARD_TIMEOUT_MS = 90000
 
-const IMPLEMENTATION_INTENT_PATTERN = /(fix|bugfix|corrig(?:e|ir|e-me|e isto)?|implement(?:a|ar)?|adicion(?:a|ar)|cria(?:r)?|altera(?:r)?|muda(?:r)?|refactor(?:a|ar)?|update|transform(?:a|ar)?|resolve(?:r)?|repair|patch|write|edit|faz(?:er)?|criar|atualiza(?:r)?)/i
+const IMPLEMENTATION_INTENT_PATTERN = /(fix|bugfix|corrig\\w*|implement\\w*|adicion\\w*|cria\\w*|altera\\w*|mud\\w*|refactor\\w*|update|transform\\w*|resolve\\w*|repair|patch|write|edit|faz\\w*|criar|atualiz\\w*|met\\w*|coloc\\w*|insir\\w*|p[õo]e\\w*|renome\\w*|remov\\w*)/i
 const EXPLANATION_INTENT_PATTERN = /(explica(?:r)?|explain|porque|porqu[eê]|why|como funciona|how does|how do|o que (?:[ée]|faz)|what is|what does|mostra(?:-me)?|show me|conte[uú]do|content|review|revisa(?:r)?|analisa(?:r)?|summari[sz]e|resume|arquitetura|architecture)/i
-const DIRECT_IMPLEMENTATION_REQUEST_PATTERN = /(corrige|implementa|adiciona|cria|altera|muda|refatora|transforma|resolve|repara|atualiza|faz|escreve|fix|implement|add|create|change|update|edit|patch|repair|write)/i
+const DIRECT_IMPLEMENTATION_REQUEST_PATTERN = /(corrig\\w*|implement\\w*|adicion\\w*|cria\\w*|altera\\w*|mud\\w*|refator\\w*|transform\\w*|resolve\\w*|repar\\w*|atualiz\\w*|faz\\w*|escrev\\w*|fix|implement|add|create|change|update|edit|patch|repair|write|met\\w*|coloc\\w*|insir\\w*|p[õo]e\\w*|renome\\w*|remov\\w*)/i
 const GUIDANCE_ABOUT_IMPLEMENTATION_PATTERN = /((how (?:to|do i|can i))|como|qual a melhor forma de|what is the best way to|podes explicar como|can you explain how to)\s+(fix|implement|add|create|change|update|edit|patch|repair|resolve|corrigir|implementar|adicionar|criar|alterar|mudar|refatorar|transformar|resolver|atualizar|fazer)/i
 const REVIEW_INTENT_PATTERN = /(review|revisa(?:r)?|analisa(?:r)?|audit|audita(?:r)?|feedback|avalia(?:r)?|check)/i
 const READ_INTENT_PATTERN = /(mostra(?:-me)?|show me|abre|open|l[eê]|read|conte[uú]do|content|ficheiro|file|lista completa|o que j[aá] est[aá] implementado|what(?:'s| is) implemented)/i
@@ -2481,6 +3478,21 @@ function classifyUserRequestIntent(text) {
 
   if (QUESTION_LIKE_PATTERN.test(normalized)) return 'explain'
   return 'unknown'
+}
+
+function resolveRunIntent(userMessage, options = {}) {
+  const interactionMode = String(options.interactionMode || '').trim().toLowerCase()
+  const chatTaskMode = String(options.chatTaskMode || '').trim().toLowerCase()
+
+  if (interactionMode === 'steer') {
+    return 'implement'
+  }
+
+  if (chatTaskMode === 'implement') {
+    return 'implement'
+  }
+
+  return classifyUserRequestIntent(userMessage)
 }
 
 function normalizeIterationBudget(value, fallback = 15) {
@@ -2515,6 +3527,80 @@ function looksLikePlanInsteadOfAction(text) {
   if (!normalized) return false
 
   return /(vou (corrigir|atualizar|adicionar|implementar)|vou primeiro (ver|analisar|inspecionar|verificar)|vou (ver|analisar|inspecionar|verificar) (o estado|os ficheiros|primeiro)|let me (first )?(check|inspect|review|look at)|i(?:'| wi)ll (first )?(check|inspect|review|look at)|here is the code|aqui est[áa] o c[oó]digo|para usar:|preencha as imagens|vou atualizar o projeto|os ficheiros corrigidos s[aã]o)/i.test(normalized)
+}
+
+function buildGroundingRecoveryInstruction(toolName, toolArgs, result) {
+  const targetPath = String(toolArgs?.path || '').trim()
+  const targetSummary = targetPath
+    ? `Target path: ${targetPath}.`
+    : 'Inspect the relevant concrete file or directory before mutating it.'
+
+  return [
+    `Grounding recovery required: ${toolName} was blocked because the target was not yet grounded in this run.`,
+    targetSummary,
+    'Do not describe the next step and do not stop.',
+    'Immediately call list_directory, find_files, search_text, read_file, or read_file_range to inspect the concrete target, then retry the requested mutation and continue until the task is actually complete.',
+    result?.error ? `Blocking error: ${result.error}` : '',
+  ].filter(Boolean).join('\n\n')
+}
+
+function buildGroundingContinuationInstruction(failureState) {
+  const targetPath = String(failureState?.toolArgs?.path || '').trim()
+
+  return [
+    'Grounding recovery is still in progress.',
+    targetPath ? `You already inspected ${targetPath}. Retry the requested mutation now using the grounded file/path.` : 'You already inspected the relevant target. Retry the requested mutation now.',
+    'Do not stop with a textual update, and do not just say the file is available in the inspector.',
+    'Apply the change with file tools, then continue verification or finish only after the requested implementation is actually done.',
+  ].join('\n\n')
+}
+
+function buildToolEnforcementRecoveryInstruction(runState) {
+  const lastReadTarget = runState?.discovery?.lastReadTarget
+
+  if (lastReadTarget?.displayPath) {
+    const rangeInstruction = lastReadTarget.usedRange && lastReadTarget.endLine
+      ? `You already inspected ${lastReadTarget.displayPath} lines ${lastReadTarget.startLine}-${lastReadTarget.endLine}. Continue from that concrete target now.`
+      : `You already inspected ${lastReadTarget.displayPath}. Continue from that concrete target now.`
+
+    return [
+      'Tool-use correction: do not output code blocks, sample code, or hypothetical edits.',
+      'This is an implementation request and must be completed with file tools.',
+      rangeInstruction,
+      `Apply the requested change in ${lastReadTarget.displayPath} with apply_patch or write_file, then verify briefly before finishing.`,
+      'Do not stop with another textual proposal.',
+    ].join('\n\n')
+  }
+
+  return [
+    'Tool-use correction: do not output code blocks, sample code, or hypothetical edits.',
+    'This is an implementation request. You must inspect the concrete existing file/form, apply the change with file tools, and continue until the requested behavior is actually implemented.',
+    'Use find_files, search_text, read_file, or read_file_range to locate the real target first if needed, then use apply_patch or write_file, then verify briefly.',
+    'Do not stop with another textual proposal.',
+  ].join('\n\n')
+}
+
+function buildProviderTimeoutRecoveryInstruction(runState) {
+  const lastReadTarget = runState?.discovery?.lastReadTarget
+
+  if (lastReadTarget?.displayPath) {
+    const rangeHint = lastReadTarget.usedRange && lastReadTarget.endLine
+      ? `${lastReadTarget.displayPath} lines ${lastReadTarget.startLine}-${lastReadTarget.endLine}`
+      : lastReadTarget.displayPath
+
+    return [
+      'The previous provider attempt timed out mid-turn.',
+      `Resume immediately from the grounded target ${rangeHint}.`,
+      'Do not restart analysis and do not repeat the same preamble.',
+      'Either apply the next concrete file change with tools now, or if you already changed files, verify them and finish briefly.',
+    ].join('\n\n')
+  }
+
+  return [
+    'The previous provider attempt timed out mid-turn.',
+    'Resume immediately from the current task state without restarting the analysis from scratch.',
+    'Do not repeat the same preamble. Move directly to the next concrete tool step or finish only if the requested implementation is already complete.',
+  ].join('\n\n')
 }
 
 function getToolCallDispatchGuardResult(toolName, rawArguments) {
@@ -2573,7 +3659,7 @@ function getRunCommandInspectionBlockReason(command) {
 }
 
 function shouldAutoRecoverValidationFailures(runIntent, runState) {
-  return runIntent === 'implement' || runState?.successfulMutationCount > 0
+  return Boolean(runState?.mutationWorkflowActive || runState?.successfulMutationCount > 0)
 }
 
 function isValidationToolExecution(toolName, result) {
@@ -2819,9 +3905,20 @@ function buildValidationRecoveryInstruction(failureState) {
   ].filter(Boolean).join('\n\n')
 }
 
-function shouldEnforceToolDrivenImplementation(userMessage, reply, runState) {
-  if (classifyUserRequestIntent(userMessage) !== 'implement') return false
-  if (runState?.successfulMutationCount > 0 && !runState?.pendingPostWriteVerification) return false
+function shouldEnforceToolDrivenImplementation(runIntent, reply, runState) {
+  const mutationWorkflowActive = Boolean(
+    runState?.mutationWorkflowActive
+    || runState?.pendingGroundingRecovery
+    || runState?.pendingPostWriteVerification
+    || runState?.successfulMutationCount > 0
+  )
+
+  if (mutationWorkflowActive) {
+    if (runState?.pendingGroundingRecovery || runState?.pendingPostWriteVerification) return true
+    if (runState?.successfulMutationCount > 0 && !runState?.pendingPostWriteVerification) return false
+  }
+
+  if (runIntent !== 'implement') return false
 
   const text = String(reply || '').trim()
   if (!text) return false
@@ -3960,42 +5057,70 @@ function executeTool(name, args, workingDir, onProgress, runState) {
           break
         }
         case 'apply_patch': {
-          const filePath = resolveToolPath(baseDir, args.path)
-          const original = fs.readFileSync(filePath, 'utf-8')
-          const occurrences = args.oldText ? original.split(args.oldText).length - 1 : 0
+          ;(async () => {
+            const filePath = resolveToolPath(baseDir, args.path)
+            const original = fs.readFileSync(filePath, 'utf-8')
+            await recordRunSnapshotFileBaseline(baseDir, runState, filePath, original, { existedBefore: true })
 
-          if (!args.oldText) {
-            resolve({ success: false, error: 'oldText is required for apply_patch' })
-            break
-          }
+            if (!args.oldText) {
+              resolve({ success: false, error: 'oldText is required for apply_patch' })
+              return
+            }
 
-          if (occurrences === 0) {
-            resolve({ success: false, error: 'oldText was not found in the file' })
-            break
-          }
+            const patchResolution = resolveApplyPatchUpdate(original, args.oldText, args.newText, Boolean(args.replaceAll))
+            if (!patchResolution.success) {
+              resolve({ success: false, error: patchResolution.error })
+              return
+            }
 
-          if (!args.replaceAll && occurrences > 1) {
-            resolve({ success: false, error: 'oldText matched more than once; refine the patch target or set replaceAll' })
-            break
-          }
+            const updated = patchResolution.updated
 
-          const updated = args.replaceAll
-            ? original.split(args.oldText).join(args.newText)
-            : original.replace(args.oldText, args.newText)
+            fs.writeFileSync(filePath, updated, 'utf-8')
+            const change = await buildMutationChangeRecord(baseDir, filePath, original, updated, runState)
+            const pendingChangeBatch = await registerStoredChatChangeMutation(runState?.senderId, runState?.chatId, baseDir, filePath, original, updated, {
+              existedBefore: true,
+              existsNow: true,
+            })
 
-          fs.writeFileSync(filePath, updated, 'utf-8')
-          resolve({
-            success: true,
-            message: `Patched ${toRelativeToolPath(baseDir, filePath)} (${args.replaceAll ? occurrences : 1} replacement${(args.replaceAll ? occurrences : 1) === 1 ? '' : 's'})`,
-            replacements: args.replaceAll ? occurrences : 1,
+            resolve({
+              success: true,
+              message: `Patched ${toRelativeToolPath(baseDir, filePath)} (${patchResolution.replacements} replacement${patchResolution.replacements === 1 ? '' : 's'})${patchResolution.normalizedLineEndings ? ' with normalized line endings' : ''}`,
+              replacements: patchResolution.replacements,
+              path: change.path,
+              changedFiles: [change],
+              pendingChangeBatch,
+            })
+          })().catch((error) => {
+            resolve({ success: false, error: error?.message || 'Failed to apply patch' })
           })
           break
         }
         case 'write_file': {
-          const filePath = resolveToolPath(baseDir, args.path)
-          fs.mkdirSync(path.dirname(filePath), { recursive: true })
-          fs.writeFileSync(filePath, args.content, 'utf-8')
-          resolve({ success: true, message: `File written: ${filePath}` })
+          ;(async () => {
+            const filePath = resolveToolPath(baseDir, args.path)
+            const existed = fs.existsSync(filePath)
+            const original = existed ? fs.readFileSync(filePath, 'utf-8') : ''
+            await recordRunSnapshotFileBaseline(baseDir, runState, filePath, original, { existedBefore: existed })
+
+            fs.mkdirSync(path.dirname(filePath), { recursive: true })
+            fs.writeFileSync(filePath, args.content, 'utf-8')
+
+            const change = await buildMutationChangeRecord(baseDir, filePath, original, args.content, runState)
+            const pendingChangeBatch = await registerStoredChatChangeMutation(runState?.senderId, runState?.chatId, baseDir, filePath, original, args.content, {
+              existedBefore: existed,
+              existsNow: true,
+            })
+
+            resolve({
+              success: true,
+              message: `${existed ? 'File updated' : 'File created'}: ${change.path}`,
+              path: change.path,
+              changedFiles: [change],
+              pendingChangeBatch,
+            })
+          })().catch((error) => {
+            resolve({ success: false, error: error?.message || 'Failed to write file' })
+          })
           break
         }
         case 'list_directory': {
@@ -4198,15 +5323,42 @@ function executeTool(name, args, workingDir, onProgress, runState) {
           break
         }
         case 'create_directory': {
-          const dirPath = resolveToolPath(baseDir, args.path)
-          fs.mkdirSync(dirPath, { recursive: true })
-          resolve({ success: true, message: `Directory created: ${dirPath}` })
+          ;(async () => {
+            const dirPath = resolveToolPath(baseDir, args.path)
+            const existed = fs.existsSync(dirPath)
+            if (!existed) {
+              await recordRunSnapshotDirectoryCreation(baseDir, runState, dirPath)
+            }
+            fs.mkdirSync(dirPath, { recursive: true })
+            resolve({ success: true, message: `Directory created: ${dirPath}` })
+          })().catch((error) => {
+            resolve({ success: false, error: error?.message || 'Failed to create directory' })
+          })
           break
         }
         case 'delete_file': {
-          const filePath = resolveToolPath(baseDir, args.path)
-          fs.unlinkSync(filePath)
-          resolve({ success: true, message: `File deleted: ${filePath}` })
+          ;(async () => {
+            const filePath = resolveToolPath(baseDir, args.path)
+            const original = fs.readFileSync(filePath, 'utf-8')
+            await recordRunSnapshotFileBaseline(baseDir, runState, filePath, original, { existedBefore: true })
+            fs.unlinkSync(filePath)
+
+            const change = await buildMutationChangeRecord(baseDir, filePath, original, '', runState)
+            const pendingChangeBatch = await registerStoredChatChangeMutation(runState?.senderId, runState?.chatId, baseDir, filePath, original, '', {
+              existedBefore: true,
+              existsNow: false,
+            })
+
+            resolve({
+              success: true,
+              message: `File deleted: ${change.path}`,
+              path: change.path,
+              changedFiles: [change],
+              pendingChangeBatch,
+            })
+          })().catch((error) => {
+            resolve({ success: false, error: error?.message || 'Failed to delete file' })
+          })
           break
         }
         default:
@@ -4250,6 +5402,30 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
         'Authorization': `Bearer ${apiKey}`,
         ...extraHeaders,
       }
+    }
+
+    let settled = false
+    let hardTimeoutId = null
+    const finalizeRequest = () => {
+      if (hardTimeoutId) {
+        clearTimeout(hardTimeoutId)
+        hardTimeoutId = null
+      }
+      if (runState?.activeRequest === req) {
+        runState.activeRequest = null
+      }
+    }
+    const resolveOnce = (value) => {
+      if (settled) return
+      settled = true
+      finalizeRequest()
+      resolve(value)
+    }
+    const rejectOnce = (error) => {
+      if (settled) return
+      settled = true
+      finalizeRequest()
+      reject(error)
     }
 
     const req = https.request(options, (res) => {
@@ -4331,12 +5507,8 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
         }
       })
       res.on('end', () => {
-        if (runState?.activeRequest === req) {
-          runState.activeRequest = null
-        }
-
         if (runState?.cancelled) {
-          reject(createAgentCancellationError())
+          rejectOnce(createAgentCancellationError())
           return
         }
 
@@ -4353,7 +5525,7 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
             error.statusCode = res.statusCode
             error.model = model
             error.details = parsed.error || parsed
-            reject(error)
+            rejectOnce(error)
           } catch {
             const error = new Error(formatProviderErrorMessage({
               providerName: hostname,
@@ -4364,7 +5536,7 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
             }))
             error.statusCode = res.statusCode
             error.model = model
-            reject(error)
+            rejectOnce(error)
           }
           return
         }
@@ -4375,7 +5547,7 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
             processSseEvent(trailingPayload)
           }
 
-          resolve({
+          resolveOnce({
             id: lastStreamResponse?.id || `stream-${Date.now()}`,
             object: lastStreamResponse?.object || 'chat.completion',
             created: lastStreamResponse?.created || Math.floor(Date.now() / 1000),
@@ -4390,9 +5562,9 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
         }
 
         try {
-          resolve(JSON.parse(data))
+          resolveOnce(JSON.parse(data))
         } catch (e) {
-          reject(new Error(`Invalid JSON from API: ${data.slice(0, 300)}`))
+          rejectOnce(new Error(`Invalid JSON from API: ${data.slice(0, 300)}`))
         }
       })
     })
@@ -4401,17 +5573,17 @@ function callOpenAiCompatibleChat({ hostname, path: requestPath, apiKey, model, 
       runState.activeRequest = req
     }
 
-    req.on('error', (error) => {
-      if (runState?.activeRequest === req) {
-        runState.activeRequest = null
-      }
+    hardTimeoutId = setTimeout(() => {
+      req.destroy(new Error(`Provider request exceeded ${Math.round(PROVIDER_REQUEST_HARD_TIMEOUT_MS / 1000)}s hard timeout`))
+    }, PROVIDER_REQUEST_HARD_TIMEOUT_MS)
 
+    req.on('error', (error) => {
       if (runState?.cancelled || isAgentCancellationError(error)) {
-        reject(createAgentCancellationError())
+        rejectOnce(createAgentCancellationError())
         return
       }
 
-      reject(error)
+      rejectOnce(error)
     })
     req.setTimeout(30000, () => {
       req.destroy(new Error('Provider request timed out after 30s'))
@@ -4497,6 +5669,7 @@ async function callGeminiWithFallback(messages, apiKey, runState, onAssistantCon
       const message = error.message || ''
       const statusCode = Number(error.statusCode || 0)
       const retryable = /rate limit|quota|temporarily unavailable|resource exhausted|too many requests|model not found|not found/i.test(message)
+        || isProviderTimeoutError(error)
         || [404, 429, 500, 502, 503, 504].includes(statusCode)
 
       logMain('model attempt failed', {
@@ -4671,7 +5844,7 @@ async function callProvider(messages, apiKey, provider, runState, onAssistantCon
 
 // ─── Agentic Loop ─────────────────────────────────────────────────────────────
 
-ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workingDir, provider, runId, chatId, approvalPolicy, iterationBudget }) => {
+ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workingDir, provider, runId, chatId, approvalPolicy, iterationBudget, interactionMode, chatTaskMode }) => {
   const resolvedRunId = runId || `run-${Date.now()}`
   const resolvedProvider = provider || 'openrouter'
   const runKey = getAgentRunKey(event.sender.id, resolvedRunId)
@@ -4686,6 +5859,7 @@ ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workin
 
   const runState = {
     runId: resolvedRunId,
+    senderId: event.sender.id,
     chatId: chatId || '',
     cancelled: false,
     activeRequest: null,
@@ -4695,6 +5869,7 @@ ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workin
     activeToolName: '',
     toolCancellation: { requested: false, toolName: '' },
     discovery: createRunDiscoveryState(),
+    mutationWorkflowActive: false,
     successfulMutationCount: 0,
     successfulVerificationCount: 0,
     pendingPostWriteVerification: false,
@@ -4702,6 +5877,8 @@ ipcMain.handle('agent:run', async (event, { userMessage, history, apiKey, workin
     validationRecoveryAttempts: 0,
     pendingValidationRecovery: false,
     lastValidationFailure: null,
+    pendingGroundingRecovery: false,
+    lastGroundingFailure: null,
     providerCursorKey,
   }
   activeAgentRuns.set(runKey, runState)
@@ -4760,7 +5937,7 @@ When writing code, follow the existing patterns in the codebase.`
   ]
 
   let iterations = 0
-  const runIntent = classifyUserRequestIntent(userMessage)
+  const runIntent = resolveRunIntent(userMessage, { interactionMode, chatTaskMode })
   const configuredIterationBudget = normalizeIterationBudget(iterationBudget, 15)
   let maxIterations = getIterationBudgetForIntent(runIntent, configuredIterationBudget)
 
@@ -4796,6 +5973,44 @@ When writing code, follow the existing patterns in the codebase.`
         if (isAgentCancellationError(e)) {
           logMain('Agent run cancelled during provider call')
           return buildCancelledAgentResult(messages, runState)
+        }
+
+        if (isProviderTimeoutError(e)) {
+          runState.providerTimeoutRecoveryAttempts = Number(runState.providerTimeoutRecoveryAttempts || 0) + 1
+          const partialReply = normalizeMessageContent(runState?.partialAssistantText || '')
+
+          logMain('Provider call timed out', {
+            attempts: runState.providerTimeoutRecoveryAttempts,
+            hasPartialReply: Boolean(partialReply),
+          })
+
+          if (partialReply) {
+            messages.push({ role: 'assistant', content: partialReply })
+
+            if (shouldEnforceToolDrivenImplementation(runIntent, partialReply, runState)) {
+              runState.toolEnforcementAttempts += 1
+              if (runState.toolEnforcementAttempts >= MAX_TOOL_ENFORCEMENT_ATTEMPTS) {
+                return toIpcSafe({
+                  success: false,
+                  error: 'The model kept timing out after replying with text/code instead of using file tools to implement the requested change.',
+                })
+              }
+
+              messages.push({
+                role: 'user',
+                content: buildToolEnforcementRecoveryInstruction(runState),
+              })
+              continue
+            }
+          }
+
+          if (runState.providerTimeoutRecoveryAttempts <= MAX_PROVIDER_TIMEOUT_RECOVERY_ATTEMPTS) {
+            messages.push({
+              role: 'user',
+              content: buildProviderTimeoutRecoveryInstruction(runState),
+            })
+            continue
+          }
         }
 
         logMain('Provider call failed', e.message)
@@ -4888,6 +6103,10 @@ When writing code, follow the existing patterns in the codebase.`
 
           toolArgs = parsedToolArgs.args
 
+          if (MUTATING_TOOL_NAMES.has(toolName)) {
+            runState.mutationWorkflowActive = true
+          }
+
           const intentScopedGuardResult = getIntentScopedToolGuardResult(toolName, toolArgs, runIntent, runState)
           if (intentScopedGuardResult) {
             logMain('tool call blocked by intent guard', {
@@ -4903,6 +6122,28 @@ When writing code, follow the existing patterns in the codebase.`
               role: 'tool',
               tool_call_id: toolCall.id,
               content: buildToolResultForModel(toolName, toolArgs, intentScopedGuardResult)
+            })
+
+            continueAgentLoop = true
+            break
+          }
+
+          const groundingError = ensureGroundedFileMutation(workingDir || process.cwd(), toolName, toolArgs, runState)
+          if (groundingError) {
+            latestToolResult = { toolName, toolArgs, result: groundingError }
+            runState.pendingGroundingRecovery = true
+            runState.lastGroundingFailure = { toolName, toolArgs, result: groundingError }
+            logMain('tool blocked by grounding guard', { tool: toolName, path: toolArgs.path || null })
+
+            messages.push({
+              role: 'tool',
+              tool_call_id: toolCall.id,
+              content: buildToolResultForModel(toolName, toolArgs, groundingError)
+            })
+
+            messages.push({
+              role: 'user',
+              content: buildGroundingRecoveryInstruction(toolName, toolArgs, groundingError)
             })
 
             continueAgentLoop = true
@@ -4945,22 +6186,6 @@ When writing code, follow the existing patterns in the codebase.`
 
           logMain('executing tool', toolName, toolArgs)
 
-          const groundingError = ensureGroundedFileMutation(workingDir || process.cwd(), toolName, toolArgs, runState)
-          if (groundingError) {
-            latestToolResult = { toolName, toolArgs, result: groundingError }
-            sendUpdate({ type: 'tool_result', tool: toolName, result: groundingError })
-            logMain('tool blocked by grounding guard', { tool: toolName, path: toolArgs.path || null })
-
-            messages.push({
-              role: 'tool',
-              tool_call_id: toolCall.id,
-              content: buildToolResultForModel(toolName, toolArgs, groundingError)
-            })
-
-            continueAgentLoop = true
-            break
-          }
-
           runState.activeToolName = toolName
           runState.toolCancellation = { requested: false, toolName }
           sendUpdate({ type: 'active_tool', stage: 'start', tool: toolName })
@@ -4983,6 +6208,8 @@ When writing code, follow the existing patterns in the codebase.`
             if (MUTATING_TOOL_NAMES.has(toolName)) {
               runState.successfulMutationCount += 1
               runState.pendingPostWriteVerification = true
+              runState.pendingGroundingRecovery = false
+              runState.lastGroundingFailure = null
             } else if (runState.pendingPostWriteVerification && VERIFICATION_TOOL_NAMES.has(toolName)) {
               runState.successfulVerificationCount += 1
               runState.pendingPostWriteVerification = false
@@ -5014,6 +6241,9 @@ When writing code, follow the existing patterns in the codebase.`
           }
 
           sendUpdate({ type: 'tool_result', tool: toolName, result })
+          if (Object.prototype.hasOwnProperty.call(result || {}, 'pendingChangeBatch')) {
+            sendUpdate({ type: 'change_batch', batch: result.pendingChangeBatch })
+          }
           logMain('tool result', toolName, { success: result.success })
 
           messages.push({
@@ -5069,10 +6299,18 @@ When writing code, follow the existing patterns in the codebase.`
           continue
         }
 
-        if (shouldEnforceToolDrivenImplementation(userMessage, reply, runState)) {
+        if (runState.pendingGroundingRecovery && runState.lastGroundingFailure) {
+          messages.push({
+            role: 'user',
+            content: buildGroundingContinuationInstruction(runState.lastGroundingFailure)
+          })
+          continue
+        }
+
+        if (shouldEnforceToolDrivenImplementation(runIntent, reply, runState)) {
           runState.toolEnforcementAttempts += 1
 
-          if (runState.toolEnforcementAttempts >= 2) {
+          if (runState.toolEnforcementAttempts >= MAX_TOOL_ENFORCEMENT_ATTEMPTS) {
             return toIpcSafe({
               success: false,
               error: runState.successfulMutationCount > 0
@@ -5085,7 +6323,7 @@ When writing code, follow the existing patterns in the codebase.`
             role: 'user',
             content: runState.successfulMutationCount > 0
               ? 'Tool-use correction: you already changed files. Do not finish yet. Verify the change with read_file, git_diff, run_build, run_test, or run_lint, then give a brief summary.'
-              : 'Tool-use correction: do not output code blocks or describe hypothetical edits. Use the available file tools to make the change directly, then verify and summarize briefly.',
+              : buildToolEnforcementRecoveryInstruction(runState),
           })
           continue
         }
@@ -5115,7 +6353,20 @@ When writing code, follow the existing patterns in the codebase.`
       }
 
       if (choice.finish_reason === 'stop') {
-        logMain('Model returned empty final content')
+        const partialReply = normalizeMessageContent(runState?.partialAssistantText || '')
+        if (partialReply) {
+          logMain('agent:run complete with streamed partial fallback', {
+            replyLength: partialReply.length,
+            replyPreview: partialReply.slice(0, 200),
+          })
+          return toIpcSafe({
+            success: true,
+            reply: partialReply,
+            messages: [...messages.slice(1), { role: 'assistant', content: partialReply }],
+          })
+        }
+
+        logMain('Model returned empty final content with no streamed fallback')
         return toIpcSafe({ success: false, error: 'Model returned an empty response' })
       }
 
@@ -5243,6 +6494,76 @@ ipcMain.handle('agent:set-approval-policy', async (event, { chatId, approvalPoli
   const normalizedPolicy = setStoredChatApprovalPolicy(event.sender.id, chatId, approvalPolicy)
   syncApprovalPolicyToActiveRuns(event.sender.id, chatId, normalizedPolicy)
   return toIpcSafe({ success: true, approvalPolicy: normalizedPolicy })
+})
+
+ipcMain.handle('change-batch:get', async (event, { chatId } = {}) => {
+  if (!chatId) {
+    return toIpcSafe({ success: false, error: 'chatId is required' })
+  }
+
+  return toIpcSafe({ success: true, batch: getStoredChatChangeBatchStatus(event.sender.id, chatId) })
+})
+
+ipcMain.handle('change-batch:set', async (event, { chatId, batch } = {}) => {
+  if (!chatId) {
+    return toIpcSafe({ success: false, error: 'chatId is required' })
+  }
+
+  return toIpcSafe({
+    success: true,
+    batch: setStoredChatChangeBatch(event.sender.id, chatId, batch),
+  })
+})
+
+ipcMain.handle('change-batch:approve', async (event, { chatId } = {}) => {
+  if (!chatId) {
+    return toIpcSafe({ success: false, error: 'chatId is required' })
+  }
+
+  if (hasActiveRunForChat(event.sender.id, chatId)) {
+    return toIpcSafe({ success: false, error: 'Cannot approve pending changes while this chat is still running' })
+  }
+
+  return toIpcSafe(approveStoredChatChangeBatch(event.sender.id, chatId))
+})
+
+ipcMain.handle('change-batch:cancel', async (event, { chatId } = {}) => {
+  if (!chatId) {
+    return toIpcSafe({ success: false, error: 'chatId is required' })
+  }
+
+  if (hasActiveRunForChat(event.sender.id, chatId)) {
+    return toIpcSafe({ success: false, error: 'Cannot cancel pending changes while this chat is still running' })
+  }
+
+  try {
+    return toIpcSafe(cancelStoredChatChangeBatch(event.sender.id, chatId))
+  } catch (error) {
+    return toIpcSafe({ success: false, error: error.message })
+  }
+})
+
+ipcMain.handle('run-snapshot:get', async (_, { workingDir } = {}) => {
+  try {
+    return toIpcSafe(await getStoredRunSnapshotStatus(workingDir || process.cwd()))
+  } catch (error) {
+    return toIpcSafe({ success: false, error: error.message, snapshot: createEmptyRunSnapshotStatus() })
+  }
+})
+
+ipcMain.handle('run-snapshot:undo', async (event, { workingDir } = {}) => {
+  try {
+    const statusResult = await getStoredRunSnapshotStatus(workingDir || process.cwd())
+    const snapshot = statusResult?.snapshot
+
+    if (snapshot?.chatId && hasActiveRunForChat(event.sender.id, snapshot.chatId)) {
+      return toIpcSafe({ success: false, error: 'Cannot undo the last run while this chat is still running' })
+    }
+
+    return toIpcSafe(await undoStoredRunSnapshot(workingDir || process.cwd(), { senderId: event.sender.id }))
+  } catch (error) {
+    return toIpcSafe({ success: false, error: error.message, snapshot: createEmptyRunSnapshotStatus() })
+  }
 })
 
 // ─── File Picker ──────────────────────────────────────────────────────────────

@@ -70,6 +70,7 @@ Transform Bliss Agent from a chat with file tools into a practical engineering a
 - GitHub issue and PR flows now cover list/search, merge-readiness checks, review threads, thread replies, thread resolve/unresolve, reviewer updates, and ready/draft transitions through `gh` plus targeted API calls.
 - Validation recovery now parses .NET, Node.js, and Python stack traces to target file-line ranges and pass the parsed failure summary into the next recovery turn.
 - Chat history now auto-compacts older turns into a persisted summary when the context meter reaches 100%, and the composer shows the live context budget plus the stored summary preview.
+- Successful file mutations now surface per-file `+added` / `-removed` stats and open current-run file or diff views directly in the preview pane.
 
 ### Planned
 
@@ -197,6 +198,25 @@ When the agent changes files, Bliss Agent should show what changed in a way that
 - Allow the user to switch from the normal file preview to the rendered diff view for the same file.
 - Prefer the actual patch or git diff for rendering so the view matches what was really changed on disk.
 - Keep the diff viewer scoped to the current run and make it easy to jump from the diff to the file preview.
+
+#### 4.11c — Turn the file viewer into a file editor
+
+The current file viewer is useful for inspection, but once a file is open the user should also be able to make direct edits and save them without leaving the preview panel.
+
+- Add an edit mode in the preview pane so the opened file content can be modified in place.
+- Allow saving the edited content back to disk from the same pane, with clear loading and error states.
+- Keep the existing read-only preview flow available for quick inspection, but make switching to edit mode frictionless.
+- Refresh the preview state after save so the visible content, line counts, and any diff/change indicators stay in sync.
+
+#### 4.11d — Approve or cancel changes since last code approval
+
+Bliss Agent should group file mutations into an approval-scoped change batch, so the user can explicitly accept or discard everything changed since the last approved state, similar to the GitHub Copilot chat flow.
+
+- Track a pending change batch starting from the last code approval baseline, including changed files and aggregate edit counts.
+- Show persistent `Approve` and `Cancel` actions in the UI whenever there are unapproved file changes, with a visible counter for the current batch size.
+- On `Approve`, mark the current batch as accepted and reset the pending change counter so subsequent edits start a fresh approval window.
+- On `Cancel`, revert all file changes made since the last approval baseline without discarding already approved changes.
+- Keep the pending batch wired into the diff viewer and file preview so the user can inspect exactly what will be approved or discarded.
 
 #### 4.12 — Intent router: explain vs implement
 
